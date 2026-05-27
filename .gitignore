@@ -1,0 +1,30 @@
+# Ambiente
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Node
+node_modules/
+.nuxt/
+dist/
+
+# Docker
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Kiro
+.kiro/
+
+# Outros
+_patch_worker.py

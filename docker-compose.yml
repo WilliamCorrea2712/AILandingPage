@@ -1,0 +1,145 @@
+version: "3.9"
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai-lp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ai_landing_pages
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - ai-lp-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ai_landing_pages"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: ai-lp-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - ai-lp-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: redis-server --appendonly yes
+
+  # ── Qdrant (Vector DB) ──────────────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: ai-lp-qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "6333:6333"
+    networks:
+      - ai-lp-network
+
+  # ── API (FastAPI) ───────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: ai-lp-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ai_landing_pages
+      REDIS_URL: redis://redis:6379/0
+      VECTOR_DB_PROVIDER: qdrant
+      VECTOR_DB_URL: http://qdrant:6333
+    volumes:
+      - ./backend:/app
+      - models:/models
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    networks:
+      - ai-lp-network
+    command: >
+      sh -c "
+        alembic upgrade head &&
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      "
+
+  # ── Celery Worker ───────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: ai-lp-worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ai_landing_pages
+      REDIS_URL: redis://redis:6379/0
+      VECTOR_DB_PROVIDER: qdrant
+      VECTOR_DB_URL: http://qdrant:6333
+    volumes:
+      - ./backend:/app
+      - models:/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ai-lp-network
+    command: celery -A app.celery_app worker -Q generation_jobs,render_jobs,image_jobs -c 2 --loglevel=info
+
+  # ── Frontend (Nuxt 3) ───────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: ai-lp-frontend
+    restart: unless-stopped
+    environment:
+      NUXT_PUBLIC_API_URL: http://localhost:8000
+      NODE_ENV: development
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.nuxt
+    ports:
+      - "3001:3000"
+    depends_on:
+      - api
+    networks:
+      - ai-lp-network
+    command: npm run dev
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  models:
+
+networks:
+  ai-lp-network:
+    driver: bridge
