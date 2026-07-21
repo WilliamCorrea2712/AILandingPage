@@ -15,6 +15,20 @@ export class ApiError extends Error {
   }
 }
 
+/** Clear auth state and redirect to login on token expiry */
+function handleUnauthorized() {
+  if (!process.client) return
+  localStorage.removeItem('auth_token')
+  localStorage.removeItem('user_id')
+  try {
+    const { useAuthStore } = require('~/stores/auth')
+    const auth = useAuthStore()
+    auth.logout()
+  } catch { /* ignore if store not available */ }
+  // Use window.location for hard redirect to avoid stale Nuxt state
+  window.location.href = '/login?reason=session_expired'
+}
+
 export async function apiFetch<T>(
   path: string,
   options: RequestInit = {},
@@ -24,7 +38,6 @@ export async function apiFetch<T>(
   const baseUrl = config.public.apiUrl
 
   // For FormData bodies, let the browser set Content-Type (includes multipart boundary).
-  // Callers can pass headers: {} to suppress the default JSON content type.
   const isFormData = options.body instanceof FormData
   const defaultHeaders: Record<string, string> = isFormData
     ? {}
@@ -35,9 +48,10 @@ export async function apiFetch<T>(
     ...(options.headers as Record<string, string> || {}),
   }
 
-  // Auto-inject token from localStorage if not provided in headers
+  // Auto-inject token from localStorage
   if (!headers['Authorization'] && !headers['authorization']) {
-    const storedToken = token || (process.client ? localStorage.getItem('auth_token') : null)
+    const storedToken = token
+      || (process.client ? localStorage.getItem('auth_token') : null)
     if (storedToken) {
       headers['Authorization'] = `Bearer ${storedToken}`
     }
@@ -47,6 +61,16 @@ export async function apiFetch<T>(
     ...options,
     headers,
   })
+
+  // Handle token expiry — clear auth and redirect to login
+  if (response.status === 401) {
+    handleUnauthorized()
+    throw new ApiError(
+      'UNAUTHORIZED',
+      'Sessao expirada. Faca login novamente.',
+      new Date().toISOString(),
+    )
+  }
 
   if (!response.ok) {
     let error: ErrorResponse

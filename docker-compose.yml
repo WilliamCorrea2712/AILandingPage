@@ -54,6 +54,42 @@ services:
     networks:
       - ai-lp-network
 
+  # ── Ollama (Local LLM) ─────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ai-lp-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - ai-lp-network
+    environment:
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_MAX_LOADED_MODELS=1
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 30s
+
+  # ── Ollama Model Puller (runs once, pulls llama3.2:3b) ──────────────────────
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: ai-lp-ollama-pull
+    networks:
+      - ai-lp-network
+    volumes:
+      - ollama_data:/root/.ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "ollama pull llama3.2:3b && echo 'Model ready'"
+    restart: "no"
+
   # ── API (FastAPI) ───────────────────────────────────────────────────────────
   api:
     build:
@@ -67,6 +103,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       VECTOR_DB_PROVIDER: qdrant
       VECTOR_DB_URL: http://qdrant:6333
+      OLLAMA_URL: http://ollama:11434
     volumes:
       - ./backend:/app
       - models:/models
@@ -79,6 +116,8 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_started
+      ollama:
+        condition: service_healthy
     networks:
       - ai-lp-network
     command: >
@@ -100,6 +139,35 @@ services:
       REDIS_URL: redis://redis:6379/0
       VECTOR_DB_PROVIDER: qdrant
       VECTOR_DB_URL: http://qdrant:6333
+      OLLAMA_URL: http://ollama:11434
+    volumes:
+      - ./backend:/app
+      - models:/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    networks:
+      - ai-lp-network
+    command: celery -A app.celery_app worker -Q generation_jobs,render_jobs,image_jobs,training_jobs -c 2 --loglevel=info
+
+  # ── Celery Beat (periodic tasks — pattern learning) ──────────────────────
+  beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: ai-lp-beat
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ai_landing_pages
+      REDIS_URL: redis://redis:6379/0
+      VECTOR_DB_PROVIDER: qdrant
+      VECTOR_DB_URL: http://qdrant:6333
+      OLLAMA_URL: http://ollama:11434
     volumes:
       - ./backend:/app
       - models:/models
@@ -110,7 +178,7 @@ services:
         condition: service_healthy
     networks:
       - ai-lp-network
-    command: celery -A app.celery_app worker -Q generation_jobs,render_jobs,image_jobs -c 2 --loglevel=info
+    command: celery -A app.celery_app beat --loglevel=info
 
   # ── Frontend (Nuxt 3) ───────────────────────────────────────────────────────
   frontend:
@@ -138,6 +206,7 @@ volumes:
   postgres_data:
   redis_data:
   qdrant_data:
+  ollama_data:
   models:
 
 networks:

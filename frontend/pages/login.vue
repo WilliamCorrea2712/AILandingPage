@@ -27,7 +27,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useAuthStore } from '~/stores/auth'
 import { apiFetch } from '~/utils/api'
 
@@ -36,6 +36,16 @@ const email = ref('')
 const password = ref('')
 const error = ref('')
 const loading = ref(false)
+
+onMounted(() => {
+  // Show message when redirected due to session expiry
+  if (process.client) {
+    const params = new URLSearchParams(window.location.search)
+    if (params.get('reason') === 'session_expired') {
+      error.value = 'Sua sessao expirou. Faca login novamente.'
+    }
+  }
+})
 
 async function handleLogin() {
   loading.value = true

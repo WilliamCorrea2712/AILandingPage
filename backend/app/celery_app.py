@@ -18,6 +18,7 @@ celery_app = Celery(
         "app.workers.render_worker",
         "app.workers.training_worker",
         "app.workers.image_worker",
+        "app.workers.learning_worker",
     ],
 )
 
@@ -28,6 +29,7 @@ celery_app.conf.update(
         "app.workers.render_worker.*": {"queue": "render_jobs"},
         "app.workers.training_worker.*": {"queue": "training_jobs"},
         "app.workers.image_worker.*": {"queue": "image_jobs"},
+        "app.workers.learning_worker.*": {"queue": "training_jobs"},
     },
     # Retry policy: max 2 retries, 30s interval
     task_max_retries=2,
@@ -44,4 +46,19 @@ celery_app.conf.update(
     # Worker settings
     worker_prefetch_multiplier=1,
     task_acks_late=True,
+    # ── Periodic tasks (Celery Beat) ────────────────────────────────────────
+    beat_schedule={
+        "weekly-pattern-learning": {
+            "task": "app.workers.learning_worker.run_pattern_learning",
+            "schedule": 604800.0,  # every 7 days in seconds
+            "args": (7,),          # analyze last 7 days
+            "options": {"queue": "training_jobs"},
+        },
+        "daily-pattern-learning": {
+            "task": "app.workers.learning_worker.run_pattern_learning",
+            "schedule": 86400.0,   # every 24h — lighter run
+            "args": (1,),          # analyze last 1 day
+            "options": {"queue": "training_jobs"},
+        },
+    },
 )

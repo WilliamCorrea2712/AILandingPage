@@ -20,6 +20,7 @@ from app.middleware.rate_limit import RateLimitMiddleware
 from app.api.auth import router as auth_router
 from app.api.generate import router as generate_router
 from app.api.logo import router as logo_router
+from app.api.feedback import router as feedback_router
 from app.api.train import router as train_router
 from app.api.publish import router as publish_router
 from app.api.projects import router as projects_router
@@ -78,6 +79,7 @@ async def generic_error_handler(request: Request, exc: Exception):
 app.include_router(auth_router)
 app.include_router(generate_router)
 app.include_router(logo_router)
+app.include_router(feedback_router)
 app.include_router(train_router)
 app.include_router(publish_router)
 app.include_router(projects_router)

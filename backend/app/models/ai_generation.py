@@ -49,10 +49,16 @@ class AIGeneration(Base):
         server_default=text("'pending'"),
         default="pending",
     )
+    niche: Mapped[str | None] = mapped_column(String(100), nullable=True)
     structured_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     html_output: Mapped[str | None] = mapped_column(Text, nullable=True)
     css_output: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_details: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    user_rating: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    # 1 = positive (👍), -1 = negative (👎), None = no feedback
+    feedback_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    feedback_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True)
     retry_count: Mapped[int] = mapped_column(
         SmallInteger,
         nullable=False,

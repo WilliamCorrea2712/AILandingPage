@@ -19,10 +19,14 @@ def run_generation_pipeline(self, job_id, prompt, project_id, brand_color=None, 
     with get_db_session() as db:
         _upd(db, job_id, "processing", "interpretando", 0.10)
         try:
-            ctx = parse_prompt(prompt)
-            _upd(db, job_id, "processing", "consultando base de conhecimento", 0.25)
+            # ── Step 1: Try Ollama LLM extraction first, fallback to regex ────
+            _upd(db, job_id, "processing", "analisando prompt com IA", 0.15)
+            ctx = _parse_prompt_smart(prompt)
+            _upd(db, job_id, "processing", "consultando base de conhecimento", 0.35)
             past = _load_past(db, ctx["niche"])
+            learned = _load_learned_patterns(db, ctx["niche"])
             ctx["past_patterns"] = past
+            ctx["learned_patterns"] = learned
             _upd(db, job_id, "processing", "gerando conteudo", 0.40)
             copy = generate_copy(ctx)
             design = generate_design(ctx, brand_color, accent_color)
@@ -200,6 +204,7 @@ NICHES: list[tuple[str, str, str]] = [
     (r"hidraulica|encanamento|encanador|instalacao\s+hidraulica", "hidraulica", "Hidraulica"),
     (r"reforma\s+residencial|reforma\s+comercial|reformas", "reformas", "Empresa de Reformas"),
     (r"designer\s+de\s+interiores|decoracao\s+de\s+interiores|arquitetura\s+de\s+interiores", "design interiores", "Designer de Interiores"),
+    (r"material(?:is)?\s+(?:de\s+)?constru[cç][aã]o|loja\s+constru[cç][aã]o|ferragem|cimento\s+loja|tijolo\s+loja|loja\s+de\s+materiais", "loja construcao", "Loja de Materiais de Construcao"),
     (r"arquitetura|arquiteto|projeto\s+arquitetonico", "arquitetura", "Escritorio de Arquitetura"),
     (r"engenharia|construcao|construtora|obra\b", "construcao", "Construtora"),
     # CASA / SERVIÇOS DOMÉSTICOS
@@ -230,13 +235,26 @@ NICHES: list[tuple[str, str, str]] = [
     (r"sorveteria|gelato|acai\b", "sorveteria", "Sorveteria"),
     (r"food\s+truck|trailer\s+de\s+comida", "food truck", "Food Truck"),
     (r"restaurante|gastronomia|almoco|jantar|culinaria", "gastronomia", "Restaurante"),
-    # E-COMMERCE / MODA
+    # E-COMMERCE / MODA — must come AFTER all specific store types
     (r"moda\s+feminina|roupa\s+feminina|vestido|blusa\s+feminina", "moda feminina", "Loja de Moda Feminina"),
     (r"moda\s+masculina|roupa\s+masculina|camisa\s+masculina", "moda masculina", "Loja de Moda Masculina"),
     (r"moda\s+infantil|roupa\s+infantil|kids\s+fashion|bebe\s+roupa", "moda infantil", "Loja de Moda Infantil"),
     (r"dropshipping|loja\s+dropship|revenda\s+online", "dropshipping", "Loja Dropshipping"),
     (r"marketplace|shopify|loja\s+virtual|e.commerce|venda\s+online", "e-commerce", "Loja Online"),
     (r"roupa|vestuario|fashion|boutique|moda\b|calcado|tenis|sapato|bolsa", "moda", "Loja de Moda"),
+    # LOJAS ESPECIALIZADAS — must come before generic \bloja\b
+    (r"auto\s*pe[cç]a|autopeca|peça\s+automotiva|acessorio\s+automotivo\s+loja", "autopecas", "Loja de Autopeças"),
+    (r"farmacia|drogaria|medicamento\s+loja|remedio\s+loja", "farmacia", "Farmácia"),
+    (r"papelaria|material\s+escolar|artigo\s+escritorio\s+loja", "papelaria", "Papelaria"),
+    (r"livraria|livro\s+loja|literatura\s+loja", "livraria", "Livraria"),
+    (r"informatica\s+loja|computador\s+loja|notebook\s+loja|celular\s+loja", "loja informatica", "Loja de Informática"),
+    (r"floricult|flores\s+loja|arranjo\s+floral|buque", "floricultura", "Floricultura"),
+    (r"optica|oculista|oculos\s+loja|lente\s+de\s+contato\s+loja", "optica", "Ótica"),
+    (r"relojoaria|relogio\s+loja|joalheria|joias\s+loja|bijuteria\s+loja", "joalheria", "Joalheria"),
+    (r"moveis\s+loja|loja\s+de\s+moveis|decoracao\s+loja|utilidade\s+domestica", "loja moveis", "Loja de Móveis"),
+    (r"material\s+esportivo|equipamento\s+esportivo|loja\s+esport", "loja esportes", "Loja de Esportes"),
+    (r"loja\s+de\s+brinquedo|brinquedo\s+loja|artigo\s+infantil\s+loja", "loja brinquedos", "Loja de Brinquedos"),
+    (r"sex\s*shop|adult\s+store|produto\s+erotico", "sex shop", "Sex Shop"),
     # PET
     (r"hotel\s+pet|hospedagem\s+pet|creche\s+pet", "hotel pet", "Hotel para Pets"),
     (r"adestramento|adestrador|comportamento\s+animal", "adestramento", "Adestramento Animal"),
@@ -350,6 +368,12 @@ NICHE_AUDIENCE: dict[str, str] = {
     "juridico": "pessoas e empresas que precisam de suporte juridico",
     "oficina": "proprietarios de veiculos que buscam qualidade e confianca",
     "construcao": "pessoas e empresas que precisam de obras de qualidade",
+    "loja construcao": "construtores, engenheiros, arquitetos e autoempreendedores",
+    "autopecas": "proprietarios de veiculos, mecanicos e frotas",
+    "farmacia": "pessoas que buscam saude, bem-estar e cosmeticos",
+    "optica": "pessoas que precisam de oculos de grau ou sol",
+    "floricultura": "pessoas que querem presentear ou decorar com flores",
+    "loja moveis": "pessoas que estao montando ou renovando seus espacos",
     "arquitetura": "pessoas que buscam projetos funcionais e esteticamente belos",
     "energia solar": "proprietarios que querem economizar na conta de luz",
     "gastronomia": "pessoas que apreciam boa gastronomia",
@@ -401,7 +425,25 @@ NICHE_DIFFS: dict[str, list[str]] = {
     "juridico": ["experiencia comprovada", "atendimento personalizado"],
     "oficina": ["diagnostico preciso", "garantia nos servicos"],
     "energia solar": ["economia garantida", "instalacao certificada"],
-    "construcao": ["qualidade comprovada", "prazo garantido"],
+    "loja construcao": ["Cimento e Argamassa", "Tijolos e Blocos", "Ferragens e Parafusos",
+        "Tintas e Revestimentos", "Madeiras e Compensados", "Material Eletrico e Hidraulico",
+        "Ferramentas e Equipamentos", "Telhas e Coberturas"],
+    "autopecas": ["Pecas de Motor", "Freios e Suspensao", "Eletrica Automotiva",
+        "Filtros e Oleos", "Embreagem e Cambio", "Acessorios Automotivos", "Pneus e Rodas"],
+    "farmacia": ["Medicamentos Sob Receita", "Medicamentos OTC", "Perfumaria e Cosmeticos",
+        "Vitaminas e Suplementos", "Produtos para Bebe", "Manipulacao de Formulas"],
+    "optica": ["Oculos de Grau", "Oculos de Sol", "Lentes de Contato",
+        "Exame de Vista", "Armacoes Premium", "Lentes Progressivas"],
+    "floricultura": ["Arranjos Florais", "Buques para Presente", "Plantas Ornamentais",
+        "Flores para Casamento", "Decoracao Floral Corporativa"],
+    "loja moveis": ["Sala de Estar", "Quarto Casal", "Cozinha Planejada",
+        "Escritorio", "Colchoes e Box", "Decoracao e Utilidades"],
+    "construcao": ["Construcao Residencial", "Construcao Comercial", "Reforma Completa",
+        "Projeto Estrutural", "Gerenciamento de Obra", "Fundacao e Estrutura"],
+    "papelaria": ["Material Escolar", "Material de Escritorio", "Impressao e Copia",
+        "Embalagens", "Artigos para Presente", "Plotter e Plotagem"],
+    "loja esportes": ["Roupas Esportivas", "Calcados para Esporte", "Equipamentos Academia",
+        "Futebol e Society", "Natacao e Corrida", "Artes Marciais"],
     "arquitetura": ["projetos exclusivos", "atencao aos detalhes"],
     "gastronomia": ["ingredientes frescos", "receitas exclusivas"],
     "moda feminina": ["pecas exclusivas", "qualidade premium"],
@@ -514,12 +556,174 @@ SERVICE_DB: dict[str, list[str]] = {
     "concursos": ["Preparatorio Concurso", "Simulados", "Legislacao", "Portugues para Concursos"],
     "igreja": ["Cultos Presenciais", "Cultos Online", "Escola Biblica", "Grupos de Celula", "Eventos Especiais"],
     "consultoria": ["Consultoria Estrategica", "Gestao Empresarial", "Planejamento", "Analise de Mercado"],
+    "construcao": ["Construcao Residencial", "Construcao Comercial", "Reforma Completa",
+        "Projeto Estrutural", "Gerenciamento de Obra", "Fundacao e Estrutura"],
+    "loja construcao": ["Cimento e Argamassa", "Tijolos e Blocos", "Ferragens e Parafusos",
+        "Tintas e Revestimentos", "Madeiras e Compensados", "Material Eletrico e Hidraulico",
+        "Ferramentas e Equipamentos", "Telhas e Coberturas"],
+    "autopecas": ["Pecas de Motor", "Freios e Suspensao", "Eletrica Automotiva",
+        "Filtros e Oleos", "Embreagem e Cambio", "Acessorios Automotivos", "Pneus e Rodas"],
+    "farmacia": ["Medicamentos Sob Receita", "Medicamentos OTC", "Perfumaria e Cosmeticos",
+        "Vitaminas e Suplementos", "Produtos para Bebe", "Manipulacao de Formulas"],
+    "optica": ["Oculos de Grau", "Oculos de Sol", "Lentes de Contato",
+        "Exame de Vista", "Armacoes Premium", "Lentes Progressivas"],
+    "floricultura": ["Arranjos Florais", "Buques para Presente", "Plantas Ornamentais",
+        "Flores para Casamento", "Decoracao Floral Corporativa"],
+    "loja moveis": ["Sala de Estar", "Quarto Casal", "Cozinha Planejada",
+        "Escritorio", "Colchoes e Box", "Decoracao e Utilidades"],
+    "papelaria": ["Material Escolar", "Material de Escritorio", "Impressao e Copia",
+        "Embalagens", "Artigos para Presente", "Plotter e Plotagem"],
+    "loja esportes": ["Roupas Esportivas", "Calcados para Esporte", "Equipamentos Academia",
+        "Futebol e Society", "Natacao e Corrida", "Artes Marciais"],
 }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PROMPT PARSER
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SMART PROMPT PARSER — LLM first, regex fallback
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_prompt_smart(prompt: str) -> dict:
+    """
+    Parse prompt using LLM + regex in parallel, with few-shot learning.
+    - Regex detects niche immediately (fast, deterministic)
+    - Niche hint passed to Ollama so it loads few-shot examples for that niche
+    - The more approved generations exist, the better Ollama performs over time
+    """
+    from app.services.nlp_service import extract_context_async, is_ollama_available
+
+    # Run regex first to get the niche hint for few-shot selection
+    regex_ctx = parse_prompt(prompt)
+    niche_hint = regex_ctx.get("niche", "")
+
+    llm_result = []
+    llm_thread = None
+    if is_ollama_available():
+        llm_thread = extract_context_async(prompt, llm_result, niche_hint=niche_hint)
+        logger.info("Ollama extraction started (niche hint: %s)", niche_hint)
+
+    if llm_thread is None:
+        logger.info("Ollama not available — using regex only (niche: %s)", niche_hint)
+        return regex_ctx
+
+    # Wait up to 45s for LLM
+    llm_thread.join(timeout=45.0)
+
+    if llm_result:
+        merged = _merge_contexts(regex_ctx, llm_result[0])
+        logger.info("LLM enrichment applied — niche: %s", merged.get("niche"))
+        return merged
+
+    logger.info("LLM timed out — using regex context (niche: %s)", niche_hint)
+    return regex_ctx
+
+
+def _merge_contexts(regex_ctx: dict, llm_ctx: dict) -> dict:
+    """
+    Merge regex and LLM contexts.
+    Strategy: regex wins for NICHE (most reliable pattern matching),
+    LLM wins for semantic/free-text fields.
+    """
+    merged = dict(regex_ctx)  # start with regex as base
+
+    # ── NICHE: regex ALWAYS wins — it has 179 specific patterns ──────────────
+    # LLM often generalizes (e.g. "loja de construção" → "e-commerce")
+    # Only use LLM niche if regex returned the generic fallback "negocios"
+    if regex_ctx.get("niche", "negocios") == "negocios":
+        llm_niche = llm_ctx.get("niche", "")
+        if llm_niche and llm_niche != "negocios":
+            merged["niche"] = llm_niche
+            merged["business_type"] = llm_ctx.get("business_type", regex_ctx.get("business_type", "Empresa"))
+
+    # ── Business name: LLM is better at extracting quoted names ──────────────
+    llm_name = llm_ctx.get("business_name", "")
+    regex_name = regex_ctx.get("business_name", "")
+    if llm_name and (not regex_name or len(llm_name) > len(regex_name)):
+        merged["business_name"] = llm_name
+
+    # ── Semantic fields: LLM wins when it has non-default values ─────────────
+    LLM_SEMANTIC = ["audience", "extra_info"]
+    for key in LLM_SEMANTIC:
+        llm_val = llm_ctx.get(key)
+        if llm_val and llm_val not in ("", "pessoas que buscam qualidade e resultados"):
+            merged[key] = llm_val
+
+    # ── Tone and intention: LLM wins if it has specific values ───────────────
+    for key in ["communication_tone", "intention"]:
+        llm_val = llm_ctx.get(key, "")
+        if llm_val and llm_val not in ("formal", "captar leads"):
+            merged[key] = llm_val
+
+    # ── Visual style: only override if user explicitly mentioned style ────────
+    llm_style = llm_ctx.get("visual_style", "")
+    if llm_style and llm_style != "moderno" and not regex_ctx.get("colors"):
+        merged["visual_style"] = llm_style
+
+    # ── Address and schedule: use whichever is more complete ──────────────────
+    if llm_ctx.get("address") and not regex_ctx.get("address"):
+        merged["address"] = llm_ctx["address"]
+    elif llm_ctx.get("address") and len(str(llm_ctx["address"])) > len(str(regex_ctx.get("address", ""))):
+        merged["address"] = llm_ctx["address"]
+
+    if llm_ctx.get("schedule") and len(llm_ctx["schedule"]) > len(regex_ctx.get("schedule", [])):
+        merged["schedule"] = llm_ctx["schedule"]
+
+    # ── Services: merge but ensure niche-relevant services win ───────────────
+    # Only add LLM services if they don't contradict the regex niche
+    llm_svcs = llm_ctx.get("services", [])
+    regex_svcs = regex_ctx.get("services", [])
+    if llm_svcs and regex_svcs:
+        # Add LLM services that don't look like generic e-commerce/online terms
+        GENERIC_TERMS = {"produtos online", "entrega rapida", "frete gratis",
+                         "catalogo digital", "compra segura", "troca facil",
+                         "loja virtual", "e-commerce", "venda online"}
+        filtered_llm = [s for s in llm_svcs
+                        if s.lower() not in GENERIC_TERMS and len(s) > 3]
+        combined = list({s.lower(): s for s in (regex_svcs + filtered_llm)}.values())
+        merged["services"] = combined[:6]
+    elif llm_svcs and not regex_svcs:
+        merged["services"] = llm_svcs[:6]
+
+    # ── Differentials: OR merge ───────────────────────────────────────────────
+    llm_diffs = llm_ctx.get("differentials", [])
+    regex_diffs = regex_ctx.get("differentials", [])
+    if llm_diffs:
+        combined_diffs = list({d.lower(): d for d in (regex_diffs + llm_diffs)}.values())
+        merged["differentials"] = combined_diffs[:4]
+
+    # ── Boolean flags: OR merge ───────────────────────────────────────────────
+    for flag in ["wants_map", "wants_form", "wants_faq", "wants_gallery",
+                 "wants_pricing", "wants_video"]:
+        merged[flag] = regex_ctx.get(flag, False) or llm_ctx.get(flag, False)
+
+    # ── Contact: regex wins (better at structured patterns) ──────────────────
+    for field in ["phone", "email", "wa", "ig"]:
+        if not merged.get(field) and llm_ctx.get(field):
+            merged[field] = llm_ctx[field]
+
+    # ── Location: use whichever is more specific ──────────────────────────────
+    if llm_ctx.get("location") and not regex_ctx.get("location"):
+        merged["location"] = llm_ctx["location"]
+
+    # ── Colors: regex wins (already hex) ─────────────────────────────────────
+    if not merged.get("colors") and llm_ctx.get("colors"):
+        merged["colors"] = llm_ctx["colors"]
+
+    # ── Testimonial count: take max ───────────────────────────────────────────
+    merged["testimonial_count"] = max(
+        regex_ctx.get("testimonial_count", 3),
+        llm_ctx.get("testimonial_count", 3),
+    )
+
+    # Auto-enable map if address found
+    if merged.get("address"):
+        merged["wants_map"] = True
+
+    return merged
 
 def parse_prompt(prompt: str) -> dict:
     p = prompt.strip()
@@ -857,6 +1061,24 @@ def _load_past(db, niche: str, limit: int = 5) -> list[dict]:
         return []
 
 
+def _load_learned_patterns(db, niche: str) -> dict[str, list[str]]:
+    """
+    Load top patterns from pattern_cache for the given niche.
+    Returns dict with keys: services, differentials, headlines, ctas
+    Falls back to empty lists if table doesn't exist yet.
+    """
+    try:
+        from app.workers.learning_worker import get_learned_patterns
+        return {
+            "services":      get_learned_patterns(db, niche, "service", 5),
+            "differentials": get_learned_patterns(db, niche, "differential", 3),
+            "headlines":     get_learned_patterns(db, niche, "headline", 3),
+            "ctas":          get_learned_patterns(db, niche, "cta", 2),
+        }
+    except Exception:
+        return {"services": [], "differentials": [], "headlines": [], "ctas": []}
+
+
 def _save_training(db, prompt: str, completion: str):
     try:
         from app.models.training_data import TrainingData
@@ -878,15 +1100,27 @@ def _save_training(db, prompt: str, completion: str):
 def generate_copy(ctx: dict) -> dict:
     name = ctx["business_name"] or ctx["business_type"]
     niche = ctx["niche"]
-    services = ctx["services"]
-    diffs = ctx["differentials"]
+    services = list(ctx["services"])
+    diffs = list(ctx["differentials"])
     audience = ctx["audience"]
     tone = ctx["communication_tone"]
     intention = ctx["intention"]
     location = ctx["location"]
     past = ctx.get("past_patterns", [])
+    learned = ctx.get("learned_patterns", {})
 
     loc = f" em {location}" if location else ""
+
+    # Enrich with learned patterns from pattern_cache
+    learned_svcs = learned.get("services", [])
+    if learned_svcs:
+        merged = list({s.lower(): s for s in (services + learned_svcs)}.values())
+        services = merged[:6]
+        ctx["services"] = services
+    learned_diffs = learned.get("differentials", [])
+    if learned_diffs and len(diffs) < 2:
+        diffs = (diffs + [d for d in learned_diffs if d not in diffs])[:4]
+
     svc_str = ", ".join(services[:2]) if services else niche
     default_diffs = NICHE_DIFFS.get(niche, ["qualidade comprovada", "atendimento especializado"])
     diff_str = " e ".join(diffs[:2]) if diffs else " e ".join(default_diffs)
@@ -953,6 +1187,7 @@ def _headline_variants(name: str, niche: str, intention: str, tone: str, loc: st
         "direito previdenciario": [f"{name}: Conquiste sua Aposentadoria com Quem Entende do INSS", f"Seus Direitos Previdenciarios Garantidos — {name}"],
         "direito trabalhista": [f"{name}: Defenda seus Direitos Trabalhistas com Especialistas", f"Justica Trabalhista ao seu Lado — {name}"],
         "energia solar": [f"{name}: Economize na Conta de Luz com Energia Solar", f"Energia Limpa e Economia Real — {name}{loc}"],
+        "loja construcao": [f"{name}: Tudo que Sua Obra Precisa em Um So Lugar{loc}", f"Do Cimento a Telha — {name} tem o que voce precisa{loc}", f"{name}: Qualidade e Preco Justo para sua Construcao"],
         "construcao": [f"{name}: Construindo Sonhos com Qualidade e Prazo Garantido", f"Sua Obra nas Maos de Quem Entende — {name}"],
         "arquitetura": [f"{name}: Projetos que Transformam Espacos em Experiencias", f"Arquitetura que Inspira — {name}"],
         "gastronomia": [f"{name}: Uma Experiencia Gastronomica Inesquecivel{loc}", f"Sabor, Qualidade e Ambiente — {name}"],
@@ -1478,6 +1713,9 @@ def render_html(ctx: dict, copy: dict, design: dict, sections: list[dict], logo_
     wa = ctx.get("wa", "")
     ig = ctx.get("ig", "")
 
+    address = ctx.get("address", "")
+    schedule = ctx.get("schedule", [])
+
     css = _build_css(p, hf, bf)
     body_parts = []
 
@@ -1495,9 +1733,9 @@ def render_html(ctx: dict, copy: dict, design: dict, sections: list[dict], logo_
         elif t == "faq":    body_parts.append(_sec_faq(copy["faq"], p, hf, bf))
         elif t == "countdown": body_parts.append(_sec_countdown(p, hf, bf, cta1))
         elif t == "form":   body_parts.append(_sec_form(ctx["form_fields"], p, hf, bf, cta1, name))
-        elif t == "map":    body_parts.append(_sec_map(name, ctx["location"], p, hf, bf, phone, email))
+        elif t == "map":    body_parts.append(_sec_map(name, ctx["location"], p, hf, bf, phone, email, address=address, schedule=schedule))
         elif t == "cta":    body_parts.append(_sec_cta(name, ctx["niche"], cta2, p, hf, bf))
-        elif t == "footer": body_parts.append(_sec_footer(name, ctx["niche"], loc, p, hf, bf, phone, email, wa, ig))
+        elif t == "footer": body_parts.append(_sec_footer(name, ctx["niche"], loc, p, hf, bf, phone, email, wa, ig, address=address, schedule=schedule))
 
     html = f"""<!DOCTYPE html>
 <html lang="pt-BR">
@@ -1628,8 +1866,12 @@ def _sec_header(name, cta1, p, hf, wa, logo_url=None):
     toa = p.get("text_on_accent", "#1A202C")
     wa_btn = f'<a href="https://wa.me/55{wa}" class="nav-cta" style="background:#25D366;color:#fff">WhatsApp</a>' if wa else f'<a href="#contato" class="nav-cta">{cta1}</a>'
     if logo_url:
+        # Strip any accidental base URL prefix (e.g. http://localhost:8000data:...)
+        clean_logo = logo_url
+        if 'data:' in logo_url and not logo_url.startswith('data:'):
+            clean_logo = logo_url[logo_url.index('data:'):]
         logo_html = (f'<a href="#inicio" class="logo-link" aria-label="{name}">'
-                     f'<img src="{logo_url}" alt="Logo {name}" class="header-logo-img" /></a>')
+                     f'<img src="{clean_logo}" alt="Logo {name}" class="header-logo-img" /></a>')
         logo_css = '.logo-link{display:flex;align-items:center;text-decoration:none}.header-logo-img{height:48px;width:auto;object-fit:contain;max-width:180px}'
     else:
         logo_html = f'<span class="logo">{name}</span>'
@@ -1795,24 +2037,37 @@ def _sec_form(fields, p, hf, bf, cta1, name):
 </section>"""
 
 
-def _sec_map(name, location, p, hf, bf, phone, email):
+def _sec_map(name, location, p, hf, bf, phone, email, address="", schedule=None):
     pri = p["primary"]
     bg = p.get("bg", "#F7FAFC")
     bg2 = p.get("bg2", "#EDF2F7")
-    loc_text = location or "Nossa localizacao"
-    phone_item = f'<div class="contact-item"><span>tel {phone}</span></div>' if phone else ''
-    email_item = f'<div class="contact-item"><span>email {email}</span></div>' if email else ''
+    loc_text = address or location or "Nossa localizacao"
+    phone_item = f'<div class="contact-item"><span>\U0001f4de {phone}</span></div>' if phone else ''
+    email_item = f'<div class="contact-item"><span>\u2709\ufe0f {email}</span></div>' if email else ''
+    schedule_html = ""
+    if schedule:
+        schedule_html = "".join(
+            f'<div class="contact-item"><span>\U0001f550 {s["day"]}' +
+            (f' \u2014 {s["event"]}' if s.get("event") else "") +
+            f': {s["time"]}h</span></div>'
+            for s in schedule
+        )
+    else:
+        schedule_html = '<div class="contact-item"><span>\U0001f550 Consulte nossos horarios</span></div>'
+    maps_url = f"https://www.google.com/maps/search/{loc_text.replace(' ', '+')}" if loc_text and loc_text != "Nossa localizacao" else "#"
     return f"""
 <section class="section map-section" id="localizacao">
   <h2>Onde Estamos</h2>
-  <p class="subtitle">Venha nos visitar em {loc_text}</p>
+  <p class="subtitle">Venha nos visitar</p>
   <div class="map-info">
-    <div class="map-placeholder">mapa</div>
+    <a href="{maps_url}" target="_blank" rel="noopener" style="display:block;text-decoration:none">
+      <div class="map-placeholder" title="Ver no Google Maps">\U0001f5fa\ufe0f<br><small style="font-size:.8rem;color:#718096;margin-top:8px;display:block">Ver no Google Maps</small></div>
+    </a>
     <div class="contact-info">
       <h3>Informacoes de Contato</h3>
-      <div class="contact-item"><span>local {loc_text}</span></div>
+      <div class="contact-item"><span>\U0001f4cd {loc_text}</span></div>
       {phone_item}{email_item}
-      <div class="contact-item"><span>horario Seg-Sex: 8h-18h | Sab: 8h-12h</span></div>
+      {schedule_html}
     </div>
   </div>
 </section>"""
@@ -1827,11 +2082,22 @@ def _sec_cta(name, niche, cta2, p, hf, bf):
 </section>"""
 
 
-def _sec_footer(name, niche, loc, p, hf, bf, phone, email, wa, ig):
-    phone_li = f'<li>tel {phone}</li>' if phone else ''
-    email_li = f'<li>email {email}</li>' if email else ''
-    wa_li = f'<li><a href="https://wa.me/55{wa}" style="color:#a0aec0">WhatsApp</a></li>' if wa else ''
-    ig_li = f'<li><a href="https://instagram.com/{ig}" style="color:#a0aec0">@{ig}</a></li>' if ig else ''
+def _sec_footer(name, niche, loc, p, hf, bf, phone, email, wa, ig, address="", schedule=None):
+    phone_li = f'<li>\U0001f4de {phone}</li>' if phone else ''
+    email_li = f'<li>\u2709\ufe0f {email}</li>' if email else ''
+    wa_li = f'<li><a href="https://wa.me/55{wa}" style="color:#a0aec0">\U0001f4ac WhatsApp</a></li>' if wa else ''
+    ig_li = f'<li><a href="https://instagram.com/{ig}" style="color:#a0aec0">\U0001f4f8 @{ig}</a></li>' if ig else ''
+    addr_li = f'<li>\U0001f4cd {address}</li>' if address else f'<li>\U0001f4cd {loc.replace(" | ", "") if loc else "Brasil"}</li>'
+    schedule_lis = ""
+    if schedule:
+        schedule_lis = "".join(
+            f'<li>\U0001f550 {s["day"]}' +
+            (f' \u2014 {s["event"]}' if s.get("event") else "") +
+            f': {s["time"]}h</li>'
+            for s in schedule
+        )
+    schedule_col_title = "Horarios" if schedule else "Links Rapidos"
+    schedule_col_content = schedule_lis if schedule else '<li><a href="#inicio" style="color:#a0aec0">Inicio</a></li><li><a href="#servicos" style="color:#a0aec0">Servicos</a></li><li><a href="#contato" style="color:#a0aec0">Contato</a></li>'
     return f"""
 <footer class="footer">
   <div class="footer-inner">
@@ -1841,18 +2107,14 @@ def _sec_footer(name, niche, loc, p, hf, bf, phone, email, wa, ig):
     </div>
     <div>
       <div class="footer-title">Contato</div>
-      <ul class="footer-links">{phone_li}{email_li}{wa_li}{ig_li}<li>local {loc.replace(' | ','') if loc else 'Brasil'}</li></ul>
+      <ul class="footer-links">{phone_li}{email_li}{wa_li}{ig_li}{addr_li}</ul>
     </div>
     <div>
-      <div class="footer-title">Links Rapidos</div>
-      <ul class="footer-links">
-        <li><a href="#inicio" style="color:#a0aec0">Inicio</a></li>
-        <li><a href="#servicos" style="color:#a0aec0">Servicos</a></li>
-        <li><a href="#contato" style="color:#a0aec0">Contato</a></li>
-      </ul>
+      <div class="footer-title">{schedule_col_title}</div>
+      <ul class="footer-links">{schedule_col_content}</ul>
     </div>
   </div>
-  <div class="footer-bottom">copyright 2024 {name} - Todos os direitos reservados{loc} | Gerado por WTech Landing Page</div>
+  <div class="footer-bottom">\u00a9 2024 {name} \u2014 Todos os direitos reservados{loc} | Gerado por WTech Landing Page</div>
 </footer>"""
 
 
@@ -1882,6 +2144,7 @@ def _save(db, job_id, project_id, structured, html, css):
             gen.structured_json = structured
             gen.html_output = html
             gen.css_output = css
+            gen.niche = structured.get("niche", "")  # save for learning queries
         proj = db.query(Project).filter_by(id=uuid.UUID(project_id)).first()
         if proj:
             proj.status = "ready"

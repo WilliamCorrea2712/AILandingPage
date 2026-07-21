@@ -16,10 +16,11 @@ router = APIRouter(tags=["jobs"])
 
 # Track progress per job_id in memory (updated by worker via DB)
 STEP_PROGRESS = {
-    "interpretando": 0.15,
-    "consultando base de conhecimento": 0.30,
-    "gerando conteudo": 0.45,
-    "montando layout": 0.65,
+    "interpretando": 0.10,
+    "analisando prompt com ia": 0.20,
+    "consultando base de conhecimento": 0.35,
+    "gerando conteudo": 0.50,
+    "montando layout": 0.70,
     "renderizando": 0.85,
     "finalizando": 0.95,
     "concluido": 1.0,
@@ -58,7 +59,8 @@ def get_job_status(
 
     # Map raw DB status to valid API status
     PROCESSING_STEPS = {
-        "interpretando", "consultando base de conhecimento",
+        "interpretando", "analisando prompt com ia",
+        "consultando base de conhecimento",
         "gerando conteudo", "montando layout", "renderizando",
         "finalizando", "concluido",
     }

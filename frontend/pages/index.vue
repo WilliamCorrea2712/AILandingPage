@@ -175,6 +175,40 @@
               <a :href="downloadUrl" download="landing-page.html" class="btn-download">Baixar HTML</a>
             </div>
           </div>
+
+          <!-- ── Feedback ──────────────────────────────────────────────── -->
+          <div class="feedback-bar">
+            <span class="feedback-label">Como ficou esta landing page?</span>
+            <div class="feedback-buttons">
+              <button
+                type="button"
+                class="feedback-btn feedback-btn--positive"
+                :class="{ 'feedback-btn--active': feedbackGiven === 1 }"
+                :disabled="feedbackGiven !== null"
+                @click="submitFeedback(1)"
+                aria-label="Gostei"
+              >
+                👍 Gostei
+              </button>
+              <button
+                type="button"
+                class="feedback-btn feedback-btn--negative"
+                :class="{ 'feedback-btn--active': feedbackGiven === -1 }"
+                :disabled="feedbackGiven !== null"
+                @click="submitFeedback(-1)"
+                aria-label="Nao gostei"
+              >
+                👎 Nao gostei
+              </button>
+            </div>
+            <p v-if="feedbackGiven === 1" class="feedback-thanks feedback-thanks--positive">
+              ✅ Obrigado! Esse resultado foi salvo para melhorar as proximas geracoes.
+            </p>
+            <p v-if="feedbackGiven === -1" class="feedback-thanks feedback-thanks--negative">
+              📝 Feedback registrado. Vamos melhorar!
+            </p>
+          </div>
+
           <div class="preview-wrapper">
             <iframe
               ref="previewFrame"
@@ -208,6 +242,10 @@ const generationDone = ref(false)
 const generatedHtml = ref('')
 const copied = ref(false)
 const previewFrame = ref<HTMLIFrameElement | null>(null)
+
+// ── Feedback state ──────────────────────────────────────────────────────────
+const feedbackGiven = ref<number | null>(null)  // 1, -1, or null
+const currentJobId = ref<string>('')
 
 // ── Logo upload state ──────────────────────────────────────────────────────
 const fileInputRef = ref<HTMLInputElement | null>(null)
@@ -268,22 +306,57 @@ async function uploadLogo(file: File) {
     const formData = new FormData()
     formData.append('file', file)
 
-    const res = await apiFetch<{
+    // Read token from Pinia store (most reliable — already loaded on mount)
+    const token = auth.token || (process.client ? localStorage.getItem('auth_token') : null) || ''
+    if (!token) {
+      errorMsg.value = 'Sessao expirada. Faca login novamente.'
+      removeLogo()
+      isUploadingLogo.value = false
+      return
+    }
+
+    // Check token expiry before uploading
+    if (auth.isTokenExpired) {
+      auth.logout()
+      errorMsg.value = 'Sua sessao expirou. Faca login novamente.'
+      removeLogo()
+      isUploadingLogo.value = false
+      setTimeout(() => navigateTo('/login?reason=session_expired'), 1500)
+      return
+    }
+
+    // Use raw fetch for multipart — avoids any header merging issues
+    const config = useRuntimeConfig()
+    const apiBase = config.public.apiUrl as string
+    const uploadRes = await fetch(`${apiBase}/upload-logo`, {
+      method: 'POST',
+      body: formData,
+      headers: { 'Authorization': `Bearer ${token}` },
+    })
+
+    if (!uploadRes.ok) {
+      // Token expired — redirect to login
+      if (uploadRes.status === 401) {
+        auth.logout()
+        errorMsg.value = 'Sua sessao expirou. Faca login novamente.'
+        removeLogo()
+        isUploadingLogo.value = false
+        setTimeout(() => navigateTo('/login?reason=session_expired'), 1500)
+        return
+      }
+      const errData = await uploadRes.json().catch(() => ({}))
+      throw new Error(errData.detail || `Erro ${uploadRes.status}`)
+    }
+
+    const res = await uploadRes.json() as {
       logo_url: string
       brand_color: string
       accent_color: string
       all_colors: string[]
-    }>('/upload-logo', {
-      method: 'POST',
-      body: formData,
-    })
+    }
 
-    // Build absolute URL so the generated HTML can load the logo from the API
-    const config = useRuntimeConfig()
-    const apiBase = config.public.apiUrl as string
-    logoServerUrl.value = res.logo_url.startsWith('http')
-      ? res.logo_url
-      : `${apiBase}${res.logo_url}`
+    // logo_url is already a base64 data URI — use directly
+    logoServerUrl.value = res.logo_url
     extractedColors.value = res.all_colors
 
     // Aplica automaticamente as cores extraídas
@@ -335,6 +408,7 @@ async function handleGenerate() {
     })
     currentStep.value = 'Job enfileirado - processando...'
     progress.value = 0.1
+    currentJobId.value = res.job_id.toString()
     await pollJob(res.job_id.toString())
   } catch (err: any) {
     errorMsg.value = err.message || 'Erro ao gerar. Tente novamente.'
@@ -346,6 +420,9 @@ async function handleGenerate() {
 async function pollJob(jobId: string) {
   const STEP_LABELS: Record<string, string> = {
     interpretando: 'Interpretando seu prompt...',
+    'analisando prompt com ia': 'Analisando prompt com IA local...',
+    'analisando prompt com IA': 'Analisando prompt com IA local...',
+    'consultando base de conhecimento': 'Consultando base de conhecimento...',
     'gerando conteudo': 'Gerando conteudo com IA...',
     'montando layout': 'Montando o layout...',
     renderizando: 'Renderizando a pagina...',
@@ -416,7 +493,23 @@ function resetForm() {
   progress.value = 0
   currentStep.value = ''
   errorMsg.value = ''
+  feedbackGiven.value = null
+  currentJobId.value = ''
   removeLogo()
+}
+
+async function submitFeedback(rating: number) {
+  if (!currentJobId.value || feedbackGiven.value !== null) return
+  try {
+    await apiFetch(`/feedback/${currentJobId.value}`, {
+      method: 'POST',
+      body: JSON.stringify({ rating }),
+    })
+    feedbackGiven.value = rating
+  } catch {
+    // Silently ignore — feedback is non-critical
+    feedbackGiven.value = rating
+  }
 }
 
 function logout() {
@@ -606,6 +699,29 @@ function logout() {
 .preview-wrapper { border: 2px solid #e2e8f0; border-radius: 8px; overflow: hidden; }
 .preview-iframe { width: 100%; height: 600px; border: none; display: block; }
 .copy-success { color: #38a169; font-size: 0.875rem; margin-top: 8px; text-align: center; }
+
+/* Feedback bar */
+.feedback-bar {
+  background: #f0f9fa; border: 1px solid #b2e0e8; border-radius: 10px;
+  padding: 16px 20px; margin-bottom: 20px;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 12px;
+}
+.feedback-label { font-size: 0.9rem; font-weight: 600; color: #2d3748; }
+.feedback-buttons { display: flex; gap: 8px; }
+.feedback-btn {
+  padding: 8px 18px; border-radius: 8px; border: 2px solid transparent;
+  font-size: 0.875rem; font-weight: 600; cursor: pointer;
+  transition: all 0.15s;
+}
+.feedback-btn--positive { background: #f0fff4; color: #276749; border-color: #9ae6b4; }
+.feedback-btn--positive:hover:not(:disabled) { background: #c6f6d5; }
+.feedback-btn--negative { background: #fff5f5; color: #c53030; border-color: #feb2b2; }
+.feedback-btn--negative:hover:not(:disabled) { background: #fed7d7; }
+.feedback-btn--active { transform: scale(1.05); box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+.feedback-btn:disabled { cursor: default; opacity: 0.7; }
+.feedback-thanks { font-size: 0.8rem; font-weight: 500; margin: 0; width: 100%; }
+.feedback-thanks--positive { color: #276749; }
+.feedback-thanks--negative { color: #744210; }
 
 @media (max-width: 600px) {
   .page-header { padding: 12px 16px; }

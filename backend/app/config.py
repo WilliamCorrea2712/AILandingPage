@@ -105,12 +105,12 @@ class Settings(BaseSettings):
     )
 
     JWT_EXPIRY_HOURS: int = Field(
-        default=24,
+        default=168,
         ge=1,
-        le=24,
+        le=720,
         description=(
             "JWT token lifetime in hours. "
-            "Maximum allowed value is 24 hours (Requirement 13.1)."
+            "Default: 168h (7 days). Maximum: 720h (30 days)."
         ),
     )
 
@@ -192,16 +192,13 @@ class Settings(BaseSettings):
     @field_validator("JWT_EXPIRY_HOURS", mode="before")
     @classmethod
     def validate_jwt_expiry(cls, value: int) -> int:
-        """Ensure JWT expiry does not exceed 24 hours (Requirement 13.1)."""
+        """Ensure JWT expiry is within reasonable bounds."""
         try:
             hours = int(value)
         except (TypeError, ValueError) as exc:
             raise ValueError("JWT_EXPIRY_HOURS must be an integer.") from exc
-        if hours > 24:
-            raise ValueError(
-                f"JWT_EXPIRY_HOURS={hours} exceeds the maximum of 24 hours "
-                "(Requirement 13.1)."
-            )
+        if hours > 720:
+            raise ValueError(f"JWT_EXPIRY_HOURS={hours} exceeds maximum of 720 hours (30 days).")
         return hours
 
 

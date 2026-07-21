@@ -1,5 +1,15 @@
 import { defineStore } from 'pinia'
 
+// Decode JWT payload without verifying signature (client-side only)
+function decodeJwtExpiry(token: string): number | null {
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1]))
+    return payload.exp ?? null  // Unix timestamp in seconds
+  } catch {
+    return null
+  }
+}
+
 export const useAuthStore = defineStore('auth', {
   state: () => ({
     token: null as string | null,
@@ -7,6 +17,13 @@ export const useAuthStore = defineStore('auth', {
   }),
   getters: {
     isAuthenticated: (state) => !!state.token,
+    isTokenExpired: (state): boolean => {
+      if (!state.token) return true
+      const exp = decodeJwtExpiry(state.token)
+      if (!exp) return false
+      // Consider expired 60s before actual expiry to avoid edge cases
+      return Date.now() / 1000 > exp - 60
+    },
   },
   actions: {
     setAuth(token: string, userId: string) {
@@ -19,8 +36,18 @@ export const useAuthStore = defineStore('auth', {
     },
     loadFromStorage() {
       if (process.client) {
-        this.token = localStorage.getItem('auth_token')
-        this.userId = localStorage.getItem('user_id')
+        const token = localStorage.getItem('auth_token')
+        const userId = localStorage.getItem('user_id')
+        if (token) {
+          // Clear expired tokens on load
+          const exp = decodeJwtExpiry(token)
+          if (exp && Date.now() / 1000 > exp) {
+            this.logout()
+            return
+          }
+        }
+        this.token = token
+        this.userId = userId
       }
     },
     logout() {

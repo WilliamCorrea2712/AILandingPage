@@ -26,5 +26,12 @@ Desktop.ini
 # Kiro
 .kiro/
 
-# Outros
-_patch_worker.py
+# Uploads — logos salvos localmente (nao versionar binarios)
+backend/uploads/
+
+# Celery Beat state (local apenas)
+backend/celerybeat-schedule
+backend/celerybeat.pid
+
+# Scripts temporarios de manutencao
+_*.py
