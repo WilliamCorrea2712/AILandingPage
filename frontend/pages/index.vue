@@ -35,13 +35,27 @@
 
           <form class="prompt-form" @submit.prevent="handleGenerate">
             <div class="form-group">
-              <label for="prompt" class="form-label">O que voce quer criar?</label>
+              <div class="prompt-label-row">
+                <label for="prompt" class="form-label">Descreva seu negocio</label>
+                <button
+                  type="button"
+                  class="btn-example"
+                  :disabled="isGenerating"
+                  @click="fillExamplePrompt"
+                >
+                  ✨ Ver exemplo completo
+                </button>
+              </div>
+              <p class="prompt-tip">
+                Descreva seu negocio abaixo — quanto mais detalhes, melhor a landing page.
+                Ou clique em <strong>"Ver exemplo completo"</strong> para preencher automaticamente e editar apenas os dados da sua empresa.
+              </p>
               <textarea
                 id="prompt"
                 v-model="prompt"
                 class="form-textarea"
-                rows="5"
-                placeholder="Ex: Landing page para clinica odontologica Sorriso Perfeito, especializada em implantes e clareamento, em Sao Paulo, estilo moderno, cores azul e branco, quero formulario com nome e WhatsApp, 3 depoimentos e FAQ"
+                rows="6"
+                placeholder="Ex: Clinica odontologica Sorriso Perfeito, especializada em implantes e clareamento, em Sao Paulo. Atendemos segunda a sexta das 8h as 18h. WhatsApp: 11999990000. Quero formulario, FAQ e 3 depoimentos."
                 minlength="10"
                 maxlength="4000"
                 required
@@ -498,6 +512,30 @@ function resetForm() {
   removeLogo()
 }
 
+function fillExamplePrompt() {
+  prompt.value = `Crie uma landing page para [TIPO DE NEGÓCIO] chamado "[NOME DO NEGÓCIO]", localizado na [ENDEREÇO COMPLETO], [CIDADE], [ESTADO].
+
+Nossos principais serviços são: [SERVIÇO 1], [SERVIÇO 2], [SERVIÇO 3].
+
+Nosso diferencial: [ex: 10 anos de experiência, atendimento 24h, garantia de satisfação].
+
+Público-alvo: [ex: famílias, empresas, jovens, profissionais].
+
+Horários de funcionamento:
+- Segunda a sexta: [HORÁRIO] às [HORÁRIO]
+- Sábado: [HORÁRIO] às [HORÁRIO]
+
+Contato:
+- Telefone: [TELEFONE]
+- WhatsApp: [WHATSAPP]
+- Instagram: @[INSTAGRAM]
+
+Estilo visual: [moderno / corporativo / minimalista / agressivo]
+Tom de comunicação: [formal / informal]
+
+Quero incluir: formulário de contato com nome e WhatsApp, 3 depoimentos de clientes, seção de serviços, FAQ com 4 perguntas, mapa com endereço e seção sobre a empresa.`
+}
+
 async function submitFeedback(rating: number) {
   if (!currentJobId.value || feedbackGiven.value !== null) return
   try {
@@ -540,7 +578,7 @@ function logout() {
 .btn-primary-nav { background: #D8AC4D; color: #1a202c; font-weight: 600; }
 
 /* Main */
-.page-main { max-width: 860px; margin: 0 auto; padding: 40px 16px; }
+.page-main { max-width: 1144px; margin: 0 auto; padding: 40px 16px; }
 
 /* Auth prompt */
 .auth-prompt { display: flex; justify-content: center; }
@@ -556,6 +594,26 @@ function logout() {
   border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 1rem;
 }
 .btn-secondary-link { color: #084753; text-decoration: none; font-size: 0.875rem; }
+
+/* Prompt label row with example button */
+.prompt-label-row {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 6px;
+}
+.prompt-tip {
+  font-size: 0.8rem; color: #718096; margin-bottom: 8px; line-height: 1.5;
+  background: #f0f9fa; border-left: 3px solid #084753;
+  padding: 8px 12px; border-radius: 0 6px 6px 0;
+}
+.btn-example {
+  background: linear-gradient(135deg, #D8AC4D, #c49a3a);
+  color: #1a202c; border: none; border-radius: 6px;
+  padding: 6px 14px; font-size: 0.8rem; font-weight: 700;
+  cursor: pointer; white-space: nowrap; transition: opacity 0.2s;
+  flex-shrink: 0;
+}
+.btn-example:hover:not(:disabled) { opacity: 0.85; }
+.btn-example:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* Prompt form */
 .prompt-section {

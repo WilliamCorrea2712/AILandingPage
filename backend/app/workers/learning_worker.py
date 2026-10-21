@@ -149,33 +149,74 @@ def _extract_from_prompt(
     weight: float,
     patterns: dict,
 ) -> None:
-    """Extract service mentions and differentials from a prompt."""
+    """
+    Extract service mentions, differentials, audience, tone, style
+    and intention signals from a prompt. More patterns → richer learning.
+    """
     import re
 
     pl = prompt.lower()
 
-    # Extract explicit service mentions ("especializada em X e Y")
-    spec_m = re.search(
-        r'especializ\w+\s+em\s+([^,\.]+?)(?:\s*,|\.|$)', pl
-    )
-    if spec_m:
-        for part in re.split(r'\s+e\s+', spec_m.group(1).strip()):
-            part_clean = part.strip().title()
-            if 4 < len(part_clean) < 60:
-                patterns[niche]["service"].append((part_clean, weight))
+    # ── Services: "especializada em X e Y", "vendemos X", "oferecemos X" ──
+    for pat in [
+        r'especializ\w+\s+em\s+([^,\.:\n]+?)(?:\s*[,\.\n]|$)',
+        r'(?:vende(?:mos)?|oferece(?:mos)?|trabalhamos\s+com)\s+([^,\.:\n]+?)(?:\s*[,\.\n]|$)',
+        r'(?:servi[cç]os?|produtos?):\s*([^,\.:\n]+?)(?:\s*[,\.\n]|$)',
+        r'nossos\s+(?:servi[cç]os?|produtos?)\s+s[aã]o\s+([^,\.:\n]+?)(?:\s*[,\.\n]|$)',
+    ]:
+        m = re.search(pat, pl)
+        if m:
+            for part in re.split(r'\s*[,e]\s+', m.group(1).strip()):
+                part_clean = part.strip().title()
+                if 3 < len(part_clean) < 60:
+                    patterns[niche]["service"].append((part_clean, weight))
 
-    # Extract differentials
+    # ── Differentials ─────────────────────────────────────────────────────
     DIFF_PATTERNS = [
-        (r"(\d+)\s*anos?\s+de\s+(?:experiencia|mercado)", "Anos de Experiencia"),
+        (r"(\d+)\s*anos?\s+de\s+(?:experiencia|mercado|atuacao)", "Anos de Experiencia"),
         (r"atendimento\s+24\s*h", "Atendimento 24h"),
-        (r"garantia\s+de\s+(?:resultado|satisfacao)", "Garantia de Resultado"),
+        (r"garantia\s+de\s+(?:resultado|satisfacao|qualidade)", "Garantia de Qualidade"),
         (r"sem\s+fidelidade", "Sem Fidelidade"),
-        (r"frete\s+gr[aá]tis", "Frete Grátis"),
-        (r"primeira\s+consulta\s+gr[aá]tis", "Primeira Consulta Grátis"),
+        (r"frete\s+gr[aá]tis|entrega\s+gr[aá]tis", "Frete Gratis"),
+        (r"primeira\s+consulta\s+gr[aá]tis|avalia[cç][aã]o\s+gr[aá]tis", "Primeira Consulta Gratis"),
+        (r"profissionais?\s+certificados?", "Profissionais Certificados"),
+        (r"tecnologia\s+de\s+ponta|equipamentos?\s+modernos?", "Tecnologia de Ponta"),
+        (r"atendimento\s+personalizado", "Atendimento Personalizado"),
+        (r"resultado\s+(?:comprovado|garantido|r[aá]pido)", "Resultado Comprovado"),
+        (r"parcelamento|parcelado\s+sem\s+juros", "Parcelamento Disponivel"),
+        (r"entrega\s+r[aá]pida|agilidade", "Entrega Rapida"),
     ]
     for pattern, diff_name in DIFF_PATTERNS:
         if re.search(pattern, pl):
             patterns[niche]["differential"].append((diff_name, weight))
+
+    # ── Visual style signal ───────────────────────────────────────────────
+    if re.search(r"premium|luxo|elegante|sofisticado|exclusivo", pl):
+        patterns[niche]["visual_style"].append(("corporativo", weight))
+    elif re.search(r"moderno|inovador|contemporaneo|digital", pl):
+        patterns[niche]["visual_style"].append(("moderno", weight))
+    elif re.search(r"minimalista|simples|clean", pl):
+        patterns[niche]["visual_style"].append(("minimalista", weight))
+    elif re.search(r"agressivo|impactante|bold|energetico", pl):
+        patterns[niche]["visual_style"].append(("agressivo", weight))
+
+    # ── Audience signal ───────────────────────────────────────────────────
+    if re.search(r"\btodos\b|p[úu]blico\s+geral|qualquer\s+pessoa", pl):
+        patterns[niche]["audience"].append(("publico geral", weight))
+    elif re.search(r"empresa|b2b|corporativo|cnpj", pl):
+        patterns[niche]["audience"].append(("empresas e profissionais", weight))
+    elif re.search(r"mulher|feminino", pl):
+        patterns[niche]["audience"].append(("mulheres", weight))
+    elif re.search(r"homem|masculino", pl):
+        patterns[niche]["audience"].append(("homens", weight))
+    elif re.search(r"jovem|universitario|estudante", pl):
+        patterns[niche]["audience"].append(("jovens e estudantes", weight))
+
+    # ── Tone signal ───────────────────────────────────────────────────────
+    if re.search(r"informal|descontraido|jovem|casual|divertido", pl):
+        patterns[niche]["tone"].append(("informal", weight))
+    elif re.search(r"formal|profissional|serio|corporativo", pl):
+        patterns[niche]["tone"].append(("formal", weight))
 
 
 def _discover_new_niches(db, generations) -> None:
@@ -202,21 +243,54 @@ def _discover_new_niches(db, generations) -> None:
 def get_learned_patterns(db, niche: str, pattern_type: str, limit: int = 5) -> list[str]:
     """
     Retrieve top patterns for a niche from the cache.
-    Used by generation worker to enrich copy with real learned data.
+    Uses a diversity-aware score that penalizes over-used patterns to prevent
+    style convergence over time.
+
+    Score formula:
+        diversity_score = avg_rating * (1 / log2(frequency + 2))
+
+    Effect:
+        - A pattern with frequency=1 and rating=2.0 scores 2.0
+        - A pattern with frequency=10 and rating=2.0 scores ~0.57
+        - A pattern with frequency=100 and rating=2.0 scores ~0.30
+
+    This naturally rotates patterns — high-quality but less-seen patterns
+    surface before overly-repeated ones, preventing style lock-in.
     """
     from app.models.pattern_cache import PatternCache
+    import math
 
     try:
+        # Fetch more than needed so we can re-rank with diversity score
+        fetch_limit = limit * 4
         rows = (
             db.query(PatternCache)
             .filter_by(niche=niche, pattern_type=pattern_type)
-            .order_by(
-                PatternCache.avg_rating.desc().nullslast(),
-                PatternCache.frequency.desc(),
-            )
-            .limit(limit)
+            .filter(PatternCache.avg_rating > 0)
+            .order_by(PatternCache.avg_rating.desc().nullslast())
+            .limit(fetch_limit)
             .all()
         )
-        return [r.value for r in rows]
+
+        if not rows:
+            # Fallback: any pattern for this niche/type regardless of rating
+            rows = (
+                db.query(PatternCache)
+                .filter_by(niche=niche, pattern_type=pattern_type)
+                .order_by(PatternCache.frequency.asc())  # least used first
+                .limit(limit)
+                .all()
+            )
+            return [r.value for r in rows]
+
+        # Re-rank by diversity score
+        def diversity_score(row) -> float:
+            rating = row.avg_rating if row.avg_rating is not None else 1.0
+            freq = max(row.frequency, 1)
+            return rating * (1.0 / math.log2(freq + 2))
+
+        ranked = sorted(rows, key=diversity_score, reverse=True)
+        return [r.value for r in ranked[:limit]]
+
     except Exception:
         return []

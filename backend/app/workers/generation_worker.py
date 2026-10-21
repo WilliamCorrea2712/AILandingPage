@@ -19,9 +19,41 @@ def run_generation_pipeline(self, job_id, prompt, project_id, brand_color=None, 
     with get_db_session() as db:
         _upd(db, job_id, "processing", "interpretando", 0.10)
         try:
-            # ── Step 1: Try Ollama LLM extraction first, fallback to regex ────
+            # ── Step 1: Parse prompt (regex + LLM in parallel) ────────────
             _upd(db, job_id, "processing", "analisando prompt com IA", 0.15)
             ctx = _parse_prompt_smart(prompt)
+
+            # ── Step 2: Check if free-form LLM generation is better ───────
+            from app.services.llm_html_generator import is_free_form_prompt, generate_html_free_form
+            if is_free_form_prompt(prompt, ctx.get("niche", "negocios")):
+                _upd(db, job_id, "processing", "gerando pagina com IA (modo livre)", 0.30)
+                logger.info("Free-form LLM generation for niche='%s'", ctx.get("niche"))
+                result = generate_html_free_form(prompt, brand_color, accent_color, logo_url)
+                if result:
+                    html, css = result
+                    # Build a minimal structured record for training/analytics
+                    name = ctx.get("business_name") or ctx.get("business_type") or "Pagina"
+                    structured = {
+                        "headline": name,
+                        "sections": ["free-form"],
+                        "niche": ctx.get("niche", "negocios"),
+                        "style": ctx.get("visual_style", "moderno"),
+                        "mode": "llm_free_form",
+                    }
+                    _save(db, job_id, project_id, structured, html, css)
+                    _save_training(db, prompt, json.dumps(structured))
+                    _upd(db, job_id, "completed", "concluido", 1.0)
+                    try:
+                        from app.services.analytics_service import record_event
+                        record_event(db, "generation_completed", user_id=user_id,
+                                     project_id=project_id, job_id=job_id)
+                    except Exception:
+                        pass
+                    return {"job_id": job_id, "status": "completed", "mode": "llm_free_form"}
+                else:
+                    logger.info("Free-form LLM unavailable — falling back to template pipeline")
+
+            # ── Step 3: Template pipeline (known niches) ──────────────────
             _upd(db, job_id, "processing", "consultando base de conhecimento", 0.35)
             past = _load_past(db, ctx["niche"])
             learned = _load_learned_patterns(db, ctx["niche"])
@@ -104,6 +136,7 @@ NICHES: list[tuple[str, str, str]] = [
     (r"estetica\s+corporal|massagem\s+modeladora|drenagem|celulite|gordura\s+localizada", "estetica corporal", "Clinica de Estetica Corporal"),
     (r"botox\s+estetico|preenchimento\s+estetico|procedimento\s+facial|skincare\s+clinica", "procedimentos esteticos", "Clinica Estetica"),
     (r"skincare|cuidados\s+com\s+a\s+pele|rotina\s+de\s+beleza|cosmetico", "skincare", "Marca de Skincare"),
+    (r"farmacia|drogaria|medicamento\s+loja|remedio\s+loja|manipulacao\s+farmac|farmaceut", "farmacia", "Farmacia"),
     (r"perfumaria|perfume|fragranc", "perfumaria", "Perfumaria"),
     (r"spa\b|massagem\s+relaxante|day\s+spa|bem.estar", "spa", "Spa"),
     (r"salao|cabeleireiro|cabelo|coloracao|escova|progressiva|manicure|pedicure", "beleza", "Salao de Beleza"),
@@ -960,14 +993,75 @@ def _extract_services(p: str, pl: str, niche: str, location: str) -> list[str]:
     if location:
         BLACKLIST.update(location.lower().split())
 
+    # Alias map: prompt keywords → SERVICE_DB entry names
+    # Handles cases where user writes informally (remedio → Medicamentos, etc.)
+    NICHE_ALIASES: dict[str, list[tuple[str, str]]] = {
+        "farmacia": [
+            (r"remedio|medicamento|med\b|receita", "Medicamentos Sob Receita"),
+            (r"perfum|cosmetico|beleza\s+prod", "Perfumaria e Cosmeticos"),
+            (r"higiene\s+pessoal|higiene|sabonete|shampoo", "Perfumaria e Cosmeticos"),
+            (r"vitamina|suplemento|mineral", "Vitaminas e Suplementos"),
+            (r"bebe|infantil|fralda|crianca\s+prod", "Produtos para Bebe"),
+            (r"manipula|formula\s+personalizada", "Manipulacao de Formulas"),
+        ],
+        "loja construcao": [
+            (r"cimento|argamassa|reboco", "Cimento e Argamassa"),
+            (r"tijolo|bloco|ceramica", "Tijolos e Blocos"),
+            (r"ferragem|parafuso|preg|fixacao", "Ferragens e Parafusos"),
+            (r"tinta|revestimento|verniz|selador", "Tintas e Revestimentos"),
+            (r"madeira|compensado|mdf\b|pinus", "Madeiras e Compensados"),
+            (r"eletrico|fio|cabo|disjuntor|tomada", "Material Eletrico e Hidraulico"),
+            (r"ferramenta|equipamento|furadeira|marreta", "Ferramentas e Equipamentos"),
+            (r"telha|cobertura|calha|rufo", "Telhas e Coberturas"),
+        ],
+        "autopecas": [
+            (r"motor|pistao|junta|rolamento", "Pecas de Motor"),
+            (r"freio|pastilha|disco\s+freio|fluido", "Freios e Suspensao"),
+            (r"suspensao|amortecedor|barra", "Freios e Suspensao"),
+            (r"eletrica|bateria|alternador|partida", "Eletrica Automotiva"),
+            (r"filtro|oleo\s+lubr|lubrificante", "Filtros e Oleos"),
+            (r"pneu|roda|aro\b", "Pneus e Rodas"),
+        ],
+        "optica": [
+            (r"oculos\s+grau|lente\s+grau|grau\b", "Oculos de Grau"),
+            (r"oculos\s+sol|lente\s+escura|sol\b", "Oculos de Sol"),
+            (r"lente\s+contato|lente\s+de\s+contato", "Lentes de Contato"),
+            (r"exame\s+vista|consulta\s+optometria|optometria", "Exame de Vista"),
+            (r"armacao|armação|aro\s+oculos", "Armacoes Premium"),
+            (r"progressiva|bifocal|multifocal", "Lentes Progressivas"),
+        ],
+        "moda feminina": [
+            (r"vestido|blusa|camisa\s+fem", "Vestidos"),
+            (r"calca|bermuda|short", "Calcas e Shorts"),
+            (r"acessorio|brinco|colar|pulseira", "Acessorios Femininos"),
+            (r"moda\s+praia|biquini|maio", "Moda Praia"),
+        ],
+        "gastronomia": [
+            (r"almoco|self.service|executivo", "Almoco Executivo"),
+            (r"jantar|a\s+la\s+carte|carte", "Jantar a La Carte"),
+            (r"delivery|entrega\s+gastr", "Delivery"),
+            (r"buffet|eventos\s+gastr|catering", "Buffet"),
+        ],
+    }
+
     found = []
     niche_services = SERVICE_DB.get(niche, [])
+
+    # 1) Try alias matching first (most accurate for informal prompts)
+    if niche in NICHE_ALIASES:
+        for pattern, svc_name in NICHE_ALIASES[niche]:
+            if re.search(pattern, pl) and svc_name not in found:
+                found.append(svc_name)
+
+    # 2) Word-match against SERVICE_DB entries
     for svc in niche_services:
+        if svc in found:
+            continue
         words = [w for w in svc.lower().split() if len(w) > 4]
         if words and any(w in pl for w in words):
-            if svc not in found:
-                found.append(svc)
+            found.append(svc)
 
+    # 3) "especializado em X" pattern
     spec_m = re.search(r'especializ\w+\s+em\s+([^,\.]+?)(?:\s*,|\s+em\s+|\s+(?:e\s+em|para|com|quero|localiz|em\s+[A-Z])|\.|$)', pl)
     if spec_m:
         for part in re.split(r'\s+e\s+', spec_m.group(1).strip()):
@@ -976,8 +1070,9 @@ def _extract_services(p: str, pl: str, niche: str, location: str) -> list[str]:
             if len(part_clean) > 3 and not any(w in BLACKLIST for w in part_words) and part_clean not in found:
                 found.append(part_clean)
 
+    # 4) Fallback to first 3 from SERVICE_DB
     if not found:
-        found = niche_services[:3] if niche_services else ["Servico Especializado", "Atendimento Personalizado", "Resultados Garantidos"]
+        found = niche_services[:3] if niche_services else ["Atendimento Especializado", "Qualidade Garantida", "Suporte Completo"]
     return found[:5]
 
 
@@ -1009,6 +1104,9 @@ def _extract_differentials(pl: str) -> list[str]:
 
 
 def _extract_audience(pl: str, niche: str) -> str:
+    # "todos" / "publico geral" overrides everything
+    if re.search(r'\btodos\b|p[úu]blico\s+geral|qualquer\s+pessoa|todas\s+as\s+idades|todas\s+as\s+pessoas', pl):
+        return NICHE_AUDIENCE.get(niche, "pessoas de todas as idades")
     if re.search(r"empresa|b2b|corporativo|negocio|cnpj", pl): return "empresas e profissionais"
     if re.search(r"jovem|universitario|estudante|adolescente", pl): return "jovens e estudantes"
     if re.search(r"familia|familiar|crianca|filho|infantil|kids|bebe|gestante|gravida", pl): return "familias com criancas"
@@ -1129,13 +1227,34 @@ def generate_copy(ctx: dict) -> dict:
     variants = _headline_variants(name, niche, intention, tone, loc, services)
     headline = next((h for h in variants if h not in used_headlines), variants[0])
 
-    if tone == "formal":
+    # Extract experience years from prompt if mentioned
+    exp_match = re.search(r'(\d+)\s*anos?\s+(?:de\s+)?(?:experiencia|mercado|atuacao)', ctx.get("original_prompt", "").lower())
+    exp_str = f" Sao {exp_match.group(1)} anos de experiencia no mercado." if exp_match else ""
+
+    # Niches that SELL products (not services) — different copy language
+    PRODUCT_NICHES = {"farmacia", "autopecas", "loja construcao", "optica", "floricultura",
+                      "loja moveis", "papelaria", "loja esportes", "moda feminina", "moda masculina",
+                      "moda infantil", "moda", "e-commerce", "petshop", "perfumaria", "joalheria",
+                      "loja informatica", "loja brinquedos", "suplementos"}
+
+    # Build contextual subtitle using real prompt data
+    if niche in PRODUCT_NICHES:
+        svc_label = "produtos" if not services else ", ".join(s.lower() for s in services[:2])
+        if tone == "formal":
+            subtitle = (f"Encontre {svc_label} com {diff_str}. "
+                        f"Atendemos {audience}{loc} com qualidade, variedade e os melhores precos.{exp_str}")
+            ctas = _ctas_formal(intention, niche)
+        else:
+            subtitle = (f"Aqui voce encontra {svc_label} com {diff_str}. "
+                        f"Pra {audience}{loc} que quer qualidade e preco justo!{exp_str}")
+            ctas = _ctas_informal(intention, niche)
+    elif tone == "formal":
         subtitle = (f"Oferecemos {svc_str} com {diff_str}. "
-                    f"Atendemos {audience} que buscam resultados reais e duradouros{loc}.")
+                    f"Atendemos {audience} que buscam resultados reais e duradouros{loc}.{exp_str}")
         ctas = _ctas_formal(intention, niche)
     else:
         subtitle = (f"A gente oferece {svc_str} com {diff_str}. "
-                    f"Feito para {audience} que querem resultados de verdade{loc}!")
+                    f"Feito para {audience} que querem resultados de verdade{loc}!{exp_str}")
         ctas = _ctas_informal(intention, niche)
 
     features = _build_features(services, diffs, niche, audience)
@@ -1143,9 +1262,11 @@ def generate_copy(ctx: dict) -> dict:
     pricing = _build_pricing(ctx) if ctx["wants_pricing"] else []
     faq = _build_faq(ctx) if ctx["wants_faq"] else []
 
+    # SEO with real data
     seo_title = f"{name} - {niche.capitalize()}{loc}"
     seo_title = (seo_title[:57] + "...") if len(seo_title) > 60 else seo_title
-    seo_desc = f"Conheca {name}, especialista em {niche}{loc}. {svc_str} com {diff_str}. Entre em contato!"
+    svc_seo = services[0].lower() if services else niche
+    seo_desc = f"Conheca o {name}, especialista em {niche}{loc}. {svc_seo.capitalize()} com {diff_str}. {ctas[0]}."
     seo_desc = (seo_desc[:157] + "...") if len(seo_desc) > 160 else seo_desc
 
     return {
@@ -1156,7 +1277,6 @@ def generate_copy(ctx: dict) -> dict:
         "seo_title": seo_title.strip(), "seo_description": seo_desc.strip(),
         "display_name": name,
     }
-
 
 def _headline_variants(name: str, niche: str, intention: str, tone: str, loc: str, services: list) -> list:
     svc = services[0].lower() if services else niche
@@ -1351,19 +1471,265 @@ def _build_features(services: list, diffs: list, niche: str, audience: str) -> l
         "estetica automotiva": ["✨", "🚗", "💎", "🏆", "🎯", "⭐"],
     }
     icons = NICHE_ICONS.get(niche, ICONS)
+
+    # Rich service descriptions by niche — specific copy per service type
+    NICHE_SVC_DESCS: dict[str, dict[str, str]] = {
+        "odontologia": {
+            "Implante Dentario": "Reponha dentes perdidos com implantes de titanio de alta durabilidade, resultado natural e funcional.",
+            "Clareamento Dental": "Clinique seu sorriso em ate 8 tons com tecnologia LED de ultima geracao, sem sensibilidade.",
+            "Ortodontia": "Aparelhos metalicos, esteticos ou alinhadores invisaveis para um sorriso alinhado e harmonioso.",
+            "Faceta de Porcelana": "Restaure a estetica dos seus dentes com facetas ultrafinas e aspecto 100% natural.",
+            "Tratamento de Canal": "Procedimento indolor com tecnologia moderna para salvar seu dente e eliminar a dor.",
+            "Limpeza Dental": "Remocao de tartaro e manchas com ultrassom para manter sua saude bucal em dia.",
+        },
+        "ortodontia": {
+            "Aparelho Metalico": "Tratamento ortodontico classico e eficaz para alinhar e corrigir a mordida.",
+            "Invisalign": "Alinhadores invisiveis e removiveis para corrigir o sorriso discretamente e com conforto.",
+            "Aparelho Estetico": "Aparelhos ceramicos ou de safira, quase invisiveis, sem abrir mao da eficiencia.",
+        },
+        "harmonizacao facial": {
+            "Toxina Botulinica": "Suavize linhas de expressao e previna o envelhecimento com aplicacao precisa e natural.",
+            "Preenchimento Labial": "Defina e volumize os labios com acido hialuronico para resultado natural e harmonioso.",
+            "Bichectomia": "Afine o rosto e realce os zigomas com procedimento minimamente invasivo.",
+            "Rinomodelacao": "Corrija imperfeicoes do nariz sem cirurgia com tecnica de preenchimento avancada.",
+        },
+        "psicologia": {
+            "Psicoterapia Individual": "Espaco seguro e acolhedor para voce se conhecer, superar bloqueios e transformar sua vida.",
+            "Terapia de Casal": "Fortaleça sua relacao com tecnicas de comunicacao e resolucao de conflitos.",
+            "Terapia Online": "Atendimento psicologico pelo computador ou celular, sem sair de casa, com total sigilo.",
+            "Terapia Cognitivo-Comportamental": "Metodo cientifico e eficaz para tratar ansiedade, depressao e outros transtornos.",
+        },
+        "fisioterapia": {
+            "Fisioterapia Ortopedica": "Reabilitacao completa de lesoes musculares, osseas e articulares com protocolo personalizado.",
+            "Fisioterapia Esportiva": "Recupere-se mais rapido e volte ao esporte com seguranca e desempenho otimizado.",
+            "Pilates Clinico": "Fortaleça o core, melhore a postura e alivie dores crônicas com metodo original.",
+            "Dry Needling": "Tecnica de agulhamento seco para alivio rapido de dores musculares e pontos de tensao.",
+        },
+        "nutricao": {
+            "Consulta Nutricional": "Avaliacao completa do seu perfil alimentar com plano personalizado para seus objetivos.",
+            "Plano Alimentar Personalizado": "Cardapio adaptado ao seu estilo de vida, metabolismo e preferencias alimentares.",
+            "Nutricao Esportiva": "Maximize seu desempenho e recuperacao com estrategia nutricional para atletas.",
+            "Emagrecimento Saudavel": "Perca peso com saude, sem restricoes absurdas, com acompanhamento contínuo.",
+        },
+        "fitness": {
+            "Musculacao": "Treinamento com pesos para ganho de massa muscular, forca e definicao corporal.",
+            "Funcional": "Treinos dinamicos que trabalham o corpo de forma integrada, melhorando condicao fisica geral.",
+            "HIIT": "Alta intensidade em menos tempo: queime gordura e melhore o condicionamento cardiovascular.",
+            "Aulas Coletivas": "Treinos em grupo com energia contagiante, diversao e resultado garantido.",
+            "Avaliacao Fisica": "Mapeamento completo do seu corpo para tracar o melhor plano de treino.",
+        },
+        "crossfit": {
+            "WOD Diario": "Treino do dia variado e desafiador, desenvolvido por coaches certificados.",
+            "Fundamentos CrossFit": "Programa de iniciacao completo para aprender os movimentos com seguranca e tecnica.",
+            "Levantamento de Peso": "Tecnica de olimpico com coaches especializados para forca e potencia maximas.",
+            "Endurance": "Desenvolvimento da resistencia metabolica com treinos especificos de capacidade aerobica.",
+        },
+        "beleza": {
+            "Coloracao": "Tecnicas exclusivas de coloracao com produtos de alta performance e menor agressao.",
+            "Luzes e Mechas": "Do babylights ao ombre hair, tecnicas personalizadas para realcar sua cor natural.",
+            "Escova Progressiva": "Alise com durabilidade de ate 6 meses com formulas sem formol.",
+            "Manicure e Pedicure": "Cuidado completo para maos e pes com esmaltacao duradoura e design personalizado.",
+            "Tratamento Capilar": "Reconstrucao profunda para cabelos danificados, ressecados ou com queda.",
+        },
+        "barbearia": {
+            "Corte Masculino": "Corte personalizado ao seu estilo com navalha, maquina e acabamento impecavel.",
+            "Barba Completa": "Modelagem, alinhamento e hidratacao da barba com produtos premium e tecnica precisa.",
+            "Pigmentacao de Barba": "Disfarce falhas e realce o visual da barba com pigmentacao profissional.",
+            "Hidratacao Capilar": "Tratamento intensivo para cabelos ressecados ou danificados pelo calor.",
+        },
+        "lash design": {
+            "Extensao de Cilios Fio a Fio": "Alongamento natural e personalizado para realcar seu olhar com elegancia.",
+            "Volume Russo": "Efeito dramático e volumoso com aplicacao de multiplos fios por cilio natural.",
+            "Mega Volume": "Olhar intenso e marcante com o maximo de volume e curvatura.",
+            "Lash Lifting": "Curvatura permanente dos cilios naturais, sem extensao, para olhar aberto e descansado.",
+        },
+        "imoveis": {
+            "Venda de Imoveis": "Encontre o imovel ideal com nossa carteira exclusiva e avaliacao profissional.",
+            "Aluguel Residencial": "Locacao segura com suporte juridico e gestao completa do imovel.",
+            "Financiamento Imobiliario": "Orientacao completa para conseguir o melhor financiamento e realizar seu sonho.",
+            "Avaliacao de Imoveis": "Laudo tecnico preciso do valor real do seu imovel para venda ou locacao.",
+        },
+        "contabilidade": {
+            "Abertura de Empresa": "Abertura de MEI, ME, LTDA e SA com todo o suporte juridico e fiscal.",
+            "Planejamento Tributario": "Reducao legal da carga tributaria com analise do melhor regime para seu negocio.",
+            "Declaracao de IR": "Declaracao do Imposto de Renda pessoa fisica e juridica sem erros e no prazo.",
+            "Folha de Pagamento": "Gestao completa da folha, esocial, FGTS e obrigacoes trabalhistas.",
+        },
+        "tecnologia": {
+            "Desenvolvimento Web": "Sites institucionais, landing pages e portais modernos, rapidos e responsivos.",
+            "Aplicativo Mobile": "Apps iOS e Android com experiencia de usuario intuitiva e performance elevada.",
+            "Sistema ERP": "Sistemas integrados de gestao para automatizar processos e ganhar escala.",
+            "Automacao de Processos": "Eliminacao de tarefas manuais com RPA e integracao de sistemas.",
+        },
+        "marketing": {
+            "Gestao de Redes Sociais": "Estrategia, criacao de conteudo e publicacao em todas as plataformas relevantes.",
+            "Trafego Pago": "Campanhas no Google, Meta e TikTok com gestao de orcamento para maximo ROI.",
+            "SEO": "Posicionamento organico no Google para atrair clientes que ja estao buscando voce.",
+            "Producao de Conteudo": "Textos, imagens, videos e reels que engajam e convertem seguidores em clientes.",
+        },
+        "gastronomia": {
+            "Almoco Executivo": "Prato principal + sobremesa + bebida em ambiente agradavel e servico agil.",
+            "Jantar a La Carte": "Pratos exclusivos preparados com ingredientes frescos e sazonais.",
+            "Delivery": "Entrega rapida com embalagem especial para manter sabor e temperatura perfeitos.",
+            "Experiencia Gastronomica": "Menu degustacao com harmonizacao de bebidas para uma noite inesquecivel.",
+        },
+        "hamburgueria": {
+            "Hamburguer Artesanal": "Blend exclusivo de carnes nobres, grelhado na chapa e montado na hora.",
+            "Smash Burger": "Tecnica americana que cria crosta crocante e interior suculento inigualavel.",
+            "Batata Frita Artesanal": "Batata cortada na hora, frita duas vezes para maximo crocante.",
+            "Combo Especial": "Hamburguer + batata frita + bebida com desconto exclusivo.",
+        },
+        "energia solar": {
+            "Projeto Solar Residencial": "Dimensionamento e instalacao de paineis fotovoltaicos para sua casa, com economia de ate 95%.",
+            "Projeto Solar Comercial": "Solucoes para empresas e industrias com maior consumo e maior retorno.",
+            "Monitoramento Online": "Acompanhe em tempo real a geracao de energia pelo app, 24h por dia.",
+            "Instalacao Certificada": "Equipe credenciada pela ANEEL com normas ABNT e garantia de 25 anos nos paineis.",
+        },
+        "loja construcao": {
+            "Cimento e Argamassa": "Marcas lideres como Votoran, Votorantim e Itambe, sempre em estoque completo.",
+            "Ferragens e Parafusos": "Mais de 5.000 itens em estoque para qualquer necessidade de fixacao e acabamento.",
+            "Tintas e Revestimentos": "Suvinil, Coral e marcas premium para acabamento interno e externo com durabilidade.",
+            "Material Eletrico e Hidraulico": "Fios, disjuntores, tubos e conexoes de marcas aprovadas por eletricistas e encanadores.",
+            "Ferramentas e Equipamentos": "Ferramentas manuais e eletricas para profissionais e autoempreendedores.",
+            "Telhas e Coberturas": "Telhas ceramicas, de fibrocimento e metalicas com entrega em obra.",
+        },
+        "autopecas": {
+            "Pecas de Motor": "Pistoes, juntas, rolamentos e componentes originais e paralelos de alta qualidade.",
+            "Freios e Suspensao": "Pastilhas, discos, amortecedores e componentes para seguranca e conforto maximos.",
+            "Filtros e Oleos": "Linha completa de filtros e oleos lubrificantes para todas as marcas e modelos.",
+            "Eletrica Automotiva": "Baterias, alternadores, motores de arranque e componentes eletricos variados.",
+        },
+        "farmacia": {
+            "Medicamentos Sob Receita": "Atendimento farmaceutico especializado com orientacao sobre posologia e interacoes.",
+            "Perfumaria e Cosmeticos": "Marcas nacionais e importadas de cuidados com a pele, cabelo e higiene pessoal.",
+            "Vitaminas e Suplementos": "Linha completa de vitaminas, minerais e suplementos para saude e bem-estar.",
+            "Produtos para Bebe": "Fraldas, higiene e cuidados especificos para recém-nascidos e criancas.",
+        },
+        "veterinaria": {
+            "Consulta Veterinaria": "Atendimento clinico completo com anamnese detalhada e diagnostico preciso.",
+            "Vacinacao": "Protocolo vacinal completo para caes e gatos, com carteirinha atualizada.",
+            "Cirurgia Veterinaria": "Centro cirurgico equipado para procedimentos eletivos e emergenciais.",
+            "Emergencia 24h": "Equipe de plantao 24 horas para atender seu pet em qualquer situacao urgente.",
+        },
+        "petshop": {
+            "Banho e Tosa": "Banho completo com shampoo especifico, secagem e acabamento com perfume.",
+            "Tosa Artistica": "Corte personalizado por tosadores especializados em todas as racas.",
+            "Hidratacao Pet": "Tratamento intensivo para pelagem seca, opaca ou com excesso de queda.",
+            "Acessorios Pet": "Coleiras, roupinhas, brinquedos e produtos para o conforto e diversao do seu pet.",
+        },
+        "turismo": {
+            "Pacotes de Viagem": "Roteiros completos com voo, hotel e passeios inclusos para os melhores destinos.",
+            "Roteiros Personalizados": "Viagens feitas sob medida para seus interesses, orcamento e datas.",
+            "Seguro Viagem": "Protecao completa para imprevistos medicos e cancelamentos durante sua viagem.",
+            "Passagens Aereas": "Melhores tarifas monitoradas 24h para nacionais e internacionais.",
+        },
+        "casamentos": {
+            "Cerimonial Completo": "Coordenacao total do evento, do planejamento ao ultimo detalhe no dia do casamento.",
+            "Decoracao": "Conceito visual exclusivo com flores, iluminacao e cenografia para seu estilo.",
+            "Buffet": "Cardapio personalizado com opcoes gourmets, veganas e infantis.",
+            "Fotografia e Filmagem": "Registro profissional com edicao cinematografica para eternizar cada momento.",
+        },
+        "educacao": {
+            "Curso Online": "Aulas gravadas e ao vivo com professores especialistas e certificado reconhecido.",
+            "Mentoria": "Acompanhamento individualizado para acelerar seu desenvolvimento profissional.",
+            "Workshop": "Aprendizado intensivo e pratico em formato presencial ou online.",
+            "Certificacao": "Diploma e certificado reconhecido pelo mercado para valorizar seu curriculo.",
+        },
+        "idiomas": {
+            "Ingles": "Do basico ao avancado com metodo comunicativo e professores nativos ou certificados.",
+            "Espanhol": "Espanhol europeu ou latino-americano com foco em conversacao rapida.",
+            "Preparatorio TOEFL/IELTS": "Preparacao intensiva para certificacoes internacionais reconhecidas mundialmente.",
+        },
+        "juridico": {
+            "Consultoria Juridica": "Analise do seu caso com orientacao clara sobre direitos, riscos e melhores caminhos.",
+            "Processo Trabalhista": "Defesa ou ajuizamento de acoes trabalhistas com expertise comprovada.",
+            "Direito Civil": "Contratos, familia, heranca e responsabilidade civil com atuacao estrategica.",
+            "Defesa Criminal": "Defesa tecnica e comprometida em todas as fases do processo penal.",
+        },
+        "infoprodutos": {
+            "Curso Online": "Conteudo gravado, didatico e atualizado, acessivel para sempre apos a compra.",
+            "Mentoria em Grupo": "Reunioes ao vivo com especialista, tira-duvidas e comunidade ativa.",
+            "Comunidade Paga": "Acesso a grupo exclusivo com conteudo diario, networking e suporte dos membros.",
+            "Ebook": "Material didatico completo em PDF para estudo no seu ritmo, onde quiser.",
+        },
+        "oficina": {
+            "Revisao Completa": "Checagem de 50 itens do veiculo com relatorio detalhado e orcamento transparente.",
+            "Troca de Oleo": "Oleo original + filtro + revisao basica com os melhores lubrificantes do mercado.",
+            "Alinhamento e Balanceamento": "Precisao milimetrica para pneus mais duradouros e direcao mais segura.",
+            "Freios": "Substituicao de pastilhas, discos e fluido com garantia de servico.",
+        },
+        "estetica automotiva": {
+            "Polimento Tecnico": "Remocao de arranhoes, oxidacao e imperfeicoes para pintura espelhada.",
+            "Vitrificacao": "Protecao ceramica de alta dureza contra raios UV, chuva acida e riscos leves.",
+            "Higienizacao Interna": "Limpeza profunda de estofados, tapetes, plasticos e desinfeccao completa.",
+            "Lavagem Detalhada": "Lavagem externa com shampoo neutro, descontaminacao e secagem manual.",
+        },
+        "arquitetura": {
+            "Projeto Arquitetonico": "Projeto completo com plantas baixas, cortes, elevacoes e perspectivas 3D.",
+            "Projeto de Interiores": "Conceito, layout de moveis, paleta de cores e selecao de materiais.",
+            "Projeto 3D": "Visualizacao fotorrealista do espaco antes da execucao para validar cada escolha.",
+            "Reforma e Ampliacao": "Projeto de reforma com solucoes criativas dentro do orcamento disponivel.",
+        },
+        "instagram": {},  # fallback para nicho generico
+    }
+
+    svc_descs = NICHE_SVC_DESCS.get(niche, {})
     features = []
     for i, svc in enumerate(services[:4]):
-        features.append({"icon": icons[i % len(icons)], "title": svc,
-                          "desc": f"Servico especializado em {svc.lower()} para {audience}."})
-    for i, diff in enumerate(diffs[:max(0, 3 - len(features))]):
-        features.append({"icon": icons[(len(features)) % len(icons)], "title": diff,
-                          "desc": f"{diff} para garantir sua total satisfacao."})
+        desc = svc_descs.get(svc) or f"{svc} com qualidade e atendimento especializado para {audience}."
+        features.append({"icon": icons[i % len(icons)], "title": svc, "desc": desc})
+    remaining = max(0, 4 - len(features))
+    for i, diff in enumerate(diffs[:remaining]):
+        diff_descs = {
+            "Atendimento Premium": "Voce recebe atencao exclusiva e personalizada em cada etapa do atendimento.",
+            "Totalmente Personalizado": "Solucao 100% adaptada ao seu perfil, objetivos e necessidades especificas.",
+            "Entrega Rapida": "Agilidade sem abrir mao da qualidade — entregamos no prazo combinado.",
+            "Garantia de Satisfacao": "Se nao ficar satisfeito, trabalhamos ate resolver. Sua satisfacao e nossa prioridade.",
+            "Anos de Experiencia": "Decadas de mercado com centenas de clientes atendidos e resultados comprovados.",
+            "Profissionais Certificados": "Equipe com formacao, especializacoes e certificacoes reconhecidas na area.",
+            "Tecnologia de Ponta": "Equipamentos e sistemas de ultima geracao para os melhores resultados.",
+            "Resultados Comprovados": "Cases reais, depoimentos e metricas que comprovam a eficacia do nosso trabalho.",
+            "Disponivel 24h": "Suporte e atendimento disponiveis 24 horas por dia, 7 dias por semana.",
+            "Atendimento Online": "Atendemos de onde voce estiver — presencial ou 100% digital conforme sua preferencia.",
+            "Consulta Gratuita": "Primeira consulta sem custo para voce conhecer nosso trabalho sem compromisso.",
+            "Parcelamento Disponivel": "Parcele sem juros e facilite o acesso ao servico que voce precisa.",
+            "Frete Gratis": "Entrega gratuita para sua regiao, sem custo adicional.",
+        }
+        desc = diff_descs.get(diff, f"{diff} para garantir sua total satisfacao e resultado esperado.")
+        features.append({"icon": icons[(len(features)) % len(icons)], "title": diff, "desc": desc})
     if not features:
-        features = [
-            {"icon": icons[0], "title": "Qualidade", "desc": f"Excelencia em {niche}."},
-            {"icon": icons[1], "title": "Experiencia", "desc": "Anos de mercado e resultados."},
-            {"icon": icons[2], "title": "Confianca", "desc": "Clientes satisfeitos em todo o Brasil."},
-        ]
+        niche_defaults = {
+            "saude": [
+                {"icon": "🏥", "title": "Equipe Especializada", "desc": "Profissionais de saude com formacao e especializacao na area."},
+                {"icon": "💊", "title": "Tratamentos Modernos", "desc": "Protocolos atualizados baseados em evidencias cientificas."},
+                {"icon": "❤️", "title": "Cuidado Humanizado", "desc": "Atendimento acolhedor que respeita voce e seu bem-estar."},
+            ],
+            "educacao": [
+                {"icon": "📚", "title": "Conteudo Atualizado", "desc": "Material didatico alinhado com as exigencias atuais do mercado."},
+                {"icon": "👨‍🏫", "title": "Professores Especialistas", "desc": "Instrutores com experiencia pratica e didatica comprovada."},
+                {"icon": "🎓", "title": "Certificacao Reconhecida", "desc": "Diploma e certificados valorizados por recrutadores e empresas."},
+            ],
+            "tecnologia": [
+                {"icon": "💻", "title": "Solucoes sob Medida", "desc": "Desenvolvimento personalizado para as necessidades do seu negocio."},
+                {"icon": "🚀", "title": "Entrega Agil", "desc": "Metodologia agil com entregas parciais e total transparencia."},
+                {"icon": "🔧", "title": "Suporte Continuo", "desc": "Equipe tecnica disponivel apos entrega para manutencao e evolucao."},
+            ],
+        }
+        # Map niche to sector for default fallback
+        NICHE_SECTOR = {
+            "odontologia": "saude", "fisioterapia": "saude", "psicologia": "saude",
+            "nutricao": "saude", "cardiologia": "saude", "veterinaria": "saude",
+            "tecnologia": "tecnologia", "saas": "tecnologia", "ia": "tecnologia",
+            "software house": "tecnologia", "desenvolvimento web": "tecnologia",
+            "educacao": "educacao", "curso online": "educacao", "idiomas": "educacao",
+        }
+        sector = NICHE_SECTOR.get(niche, "")
+        features = niche_defaults.get(sector, [
+            {"icon": icons[0], "title": "Qualidade Comprovada", "desc": f"Excelencia em {niche} com metodologia testada e aprovada pelos nossos clientes."},
+            {"icon": icons[1], "title": "Experiencia de Mercado", "desc": "Anos de atuacao com centenas de clientes satisfeitos em todo o Brasil."},
+            {"icon": icons[2], "title": "Suporte Dedicado", "desc": "Nossa equipe esta disponivel para atender, orientar e resolver qualquer duvida."},
+            {"icon": icons[3] if len(icons) > 3 else icons[0], "title": "Resultado Garantido", "desc": "Trabalhamos com metas claras e acompanhamento constante para garantir seus resultados."},
+        ])
     return features
 
 
@@ -1461,6 +1827,37 @@ def _build_testimonials(ctx: dict) -> list:
             (f"Meu carro estava com um problema que nenhuma oficina resolvia. O {name} diagnosticou e resolveu na hora!", "Paulo R."),
             (f"Atendimento honesto e preco justo. O {name} e a unica oficina em que confio meu carro.", "Sandra M."),
             (f"Revisao completa feita com qualidade e no prazo. O {name} e referencia em mecanica.", "Carlos T."),
+        ],
+        "farmacia": [
+            (f"Sempre que preciso de medicamento, vou ao {name}. Atendimento rapido, 24 horas e os farmaceuticos tiram todas as duvidas.", "Claudia R."),
+            (f"O {name} tem tudo que preciso em um so lugar: remedio, perfumaria e higiene pessoal. Atendimento excelente e preco justo.", "Mario S."),
+            (f"Me surpreendi com o atendimento farmaceutico do {name}. Explicaram direitinho sobre o meu medicamento e as interacoes. Recomendo muito!", "Patricia O."),
+            (f"Farmacia que funciona 24h e ainda tem atendimento humanizado e de qualidade. O {name} e minha farmacia de confianca em Franca.", "Rafael M."),
+        ],
+        "autopecas": [
+            (f"Encontrei a peca que nenhuma loja tinha no {name}. Atendimento rapido e preco justo. Recomendo para todos os mecanicos.", "Marcelo G."),
+            (f"Compro pecas no {name} ha anos. Qualidade garantida, entrega rapida e equipe que entende do assunto.", "Carlos A."),
+            (f"O {name} tem um estoque impressionante. Acabei com meu problema no mesmo dia, sem precisar encomendar.", "Rodrigo P."),
+        ],
+        "loja construcao": [
+            (f"O {name} tem tudo que preciso para minha obra em um so lugar. Entrega rapida e preco competitivo.", "Engenheiro Rafael S."),
+            (f"Como mestre de obras, sempre indico o {name} para os clientes. Material de qualidade e equipe que entende de construcao.", "Joao Mestre"),
+            (f"Reformei minha casa inteira com materiais do {name}. Otimo atendimento e os produtos chegaram dentro do prazo.", "Ana Paula C."),
+        ],
+        "optica": [
+            (f"Fiz meu exame de vista no {name} e meus novos oculos ficaram prontos no mesmo dia. Servico impecavel!", "Sandra M."),
+            (f"Os optometristas do {name} foram super atenciosos e me ajudaram a escolher a armacao perfeita para meu rosto.", "Beatriz T."),
+            (f"Compro meus oculos no {name} ha 5 anos. Qualidade excelente, variedade de armacoes e preco justo.", "Carlos F."),
+        ],
+        "veterinaria": [
+            (f"O {name} salvou a vida do meu cachorro! Equipe competente, emergencia 24h e que realmente ama os animais.", "Tutora Ana"),
+            (f"Minha gata recebe o melhor cuidado no {name}. Profissionais que tratam nossos pets como familia.", "Tutor Carlos"),
+            (f"Atendimento de emergencia rapido e eficiente no {name}. Meu pet se recuperou completamente!", "Tutora Maria"),
+        ],
+        "petshop": [
+            (f"Meu cachorro ama ir ao {name}! Saiu lindo, perfumado e super feliz. Os tosadores sao incriveis.", "Tutora Carla"),
+            (f"Atendimento carinhoso e profissional no {name}. Minha gata fica sempre em boas maos.", "Tutor Pedro"),
+            (f"O {name} tem tudo para o meu pet: banho, tosa, racao e acessorios. Ambiente limpo e equipe dedicada.", "Tutora Luciana"),
         ],
     }
     if niche in NICHE_T:
@@ -1566,14 +1963,63 @@ def _build_faq(ctx: dict) -> list:
             {"q": "Os paineis funcionam em dias nublados?", "a": f"Sim! Os paineis instalados pelo {name} geram energia mesmo em dias nublados, com eficiencia reduzida mas funcional."},
             {"q": "Qual a garantia dos equipamentos?", "a": f"O {name} trabalha com equipamentos de primeira linha, com garantia de 25 anos nos paineis e 10 anos nos inversores."},
         ],
+        "farmacia": [
+            {"q": "Quais medicamentos voces vendem?", "a": f"O {name} trabalha com medicamentos com e sem receita, genericos, similares e de referencia. Tambem fazemos manipulacao de formulas especiais."},
+            {"q": "O {name} funciona 24 horas?", "a": f"Sim! O {name} atende 24 horas por dia, 7 dias por semana, incluindo feriados, para que voce nunca fique sem o seu medicamento."},
+            {"q": "Voces entregam em casa?", "a": f"Sim! O {name} oferece servico de delivery de medicamentos e produtos. Consulte nossa area de entrega e horarios disponíveis."},
+            {"q": "Posso solicitar orientacao farmaceutica?", "a": f"Com certeza! No {name} contamos com farmaceuticos responsaveis disponiveis para orientar sobre medicamentos, posologia, interacoes e cuidados necessarios."},
+        ],
+        "autopecas": [
+            {"q": "Voces trabalham com pecas originais e paralelas?", "a": f"Sim! O {name} oferece pecas originais, paralelas e recondicionadas de qualidade para todas as marcas e modelos."},
+            {"q": "Tem garantia nas pecas?", "a": f"Todas as pecas vendidas pelo {name} possuem garantia do fabricante. Trabalhamos apenas com fornecedores certificados."},
+            {"q": "Fazem instalacao das pecas?", "a": f"O {name} e especializado em venda de pecas. Para instalacao, podemos indicar oficinas parceiras de confianca na regiao."},
+            {"q": "Qual o prazo para pecas sob encomenda?", "a": f"Pecas que nao estao no estoque podem ser encomendadas com prazo de 2 a 5 dias uteis. Fale com nossa equipe."},
+        ],
+        "optica": [
+            {"q": "O exame de vista e gratuito?", "a": f"Sim! O {name} oferece exame de vista gratuito com nossos optometristas para te ajudar a escolher as lentes certas."},
+            {"q": "Qual o prazo para ficar pronto o oculos?", "a": f"Oculos simples ficam prontos em ate 1 hora. Lentes progressivas e especiais podem levar de 3 a 7 dias uteis no {name}."},
+            {"q": "Voces aceitam convenio?", "a": f"Sim! O {name} trabalha com os principais convenios de saude. Consulte nossa equipe para verificar seu plano."},
+            {"q": "E possivel comprar so a armacao?", "a": f"Claro! No {name} voce pode comprar armacoes avulsas e aproveitar suas lentes atuais, ou montar o oculos completo conosco."},
+        ],
+        "loja construcao": [
+            {"q": "Voces entregam os materiais na obra?", "a": f"Sim! O {name} oferece entrega de materiais diretamente na sua obra em Franca e regiao. Consulte prazos e areas de atendimento."},
+            {"q": "Tem desconto para compras em quantidade?", "a": f"Sim! O {name} oferece tabela especial para construtores, engenheiros e compras em grande volume. Solicite orcamento."},
+            {"q": "Voces tem assessoria tecnica?", "a": f"Nossa equipe do {name} esta preparada para auxiliar na escolha dos materiais certos para cada etapa da sua obra."},
+            {"q": "Qual a forma de pagamento?", "a": f"O {name} aceita dinheiro, pix, cartao de debito e credito, e oferece faturamento para empresas do setor."},
+        ],
+        "veterinaria": [
+            {"q": "Voces atendem emergencias?", "a": f"Sim! O {name} possui plantao de emergencia 24 horas para atender seu pet em situacoes urgentes."},
+            {"q": "Quais especies voces atendem?", "a": f"O {name} atende caes, gatos, aves, coelhos e pequenos mamiferos. Consulte nossa equipe para outras especies."},
+            {"q": "Precisao de agendamento?", "a": f"Consultas de rotina precisam de agendamento. Emergencias sao atendidas imediatamente, sem necessidade de hora marcada."},
+            {"q": "Voces fazem vacinacao?", "a": f"Sim! O {name} segue o protocolo vacinal completo para caes e gatos, com carteirinha digital atualizada."},
+        ],
+        "petshop": [
+            {"q": "Preciso agendar o banho e tosa?", "a": f"Recomendamos agendamento pelo WhatsApp ou telefone do {name} para garantir horario. Em alguns casos atendemos sem agendamento."},
+            {"q": "Quanto tempo leva o banho e tosa?", "a": f"Dependendo do porte e pelagem do pet, o servico no {name} leva de 1h30 a 3 horas. Avisamos quando estiver pronto."},
+            {"q": "Quais racas voces atendem?", "a": f"O {name} atende todas as racas de caes e gatos. Temos tosadores especializados em racas com tosa especifica."},
+            {"q": "Os produtos usados sao seguros?", "a": f"Sim! O {name} usa apenas produtos hipoalergênicos, dermato testados e seguros para pets de todas as idades."},
+        ],
     }
     if niche in NICHE_F:
         return NICHE_F[niche]
+
+    # Smart generic fallback — avoids "serviço" language for product-based niches
+    LOJA_NICHES = {"farmacia", "autopecas", "loja construcao", "optica", "floricultura",
+                   "loja moveis", "papelaria", "loja esportes", "loja brinquedos",
+                   "loja informatica", "moda feminina", "moda masculina", "moda infantil",
+                   "moda", "e-commerce", "petshop", "perfumaria", "joalheria"}
+    if niche in LOJA_NICHES:
+        return [
+            {"q": f"Qual o horario de funcionamento do {name}?", "a": f"Consulte nossos horarios de atendimento pelo WhatsApp ou Instagram. Estamos prontos para atender voce!"},
+            {"q": "Voces fazem entrega?", "a": f"Sim! O {name} oferece opcoes de entrega. Entre em contato para saber sobre prazos e areas atendidas."},
+            {"q": "Qual a forma de pagamento aceita?", "a": f"O {name} aceita dinheiro, pix, cartao de debito e credito. Parcelamento disponivel conforme a compra."},
+            {"q": "Como faço para tirar duvidas sobre um produto?", "a": f"Fale diretamente com nossa equipe do {name} pelo WhatsApp. Respondemos rapido e ajudamos a encontrar o produto certo."},
+        ]
     return [
-        {"q": f"Como funciona o servico do {name}?", "a": f"Nosso processo e simples e transparente. Entre em contato e nossa equipe especializada em {niche} ira guia-lo em cada etapa."},
-        {"q": "Qual o prazo de atendimento?", "a": "Respondemos em ate 24 horas uteis. Para urgencias, temos atendimento prioritario disponivel."},
-        {"q": "Voces atendem em todo o Brasil?", "a": "Sim! Atendemos clientes em todo o territorio nacional, com opcoes de atendimento presencial e online."},
-        {"q": "Como posso agendar?", "a": f"Basta preencher o formulario nesta pagina ou entrar em contato diretamente. Nossa equipe do {name} retornara em breve."},
+        {"q": f"Como funciona o atendimento do {name}?", "a": f"E simples: entre em contato pelo formulario ou WhatsApp e nossa equipe especializada em {niche} responde rapidamente."},
+        {"q": "Qual o horario de atendimento?", "a": f"Entre em contato com o {name} para conhecer nossos horarios. Temos opcoes de atendimento presencial e online."},
+        {"q": "Voces atendem minha regiao?", "a": f"O {name} atende localmente e em todo o Brasil via atendimento online ou entrega. Consulte nossa equipe."},
+        {"q": "Como posso entrar em contato?", "a": f"Preencha o formulario nesta pagina, fale pelo WhatsApp ou visite o {name} pessoalmente. Respondemos em breve."},
     ]
 
 
@@ -1665,36 +2111,138 @@ def _lighten(hex_color: str, amount: float) -> str:
 # SECTION BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+# ── Niche default section layouts ─────────────────────────────────────────────
+NICHE_SECTION_DEFAULTS = {
+    "odontologia":         ["features", "about", "testimonials", "faq", "form", "map"],
+    "ortodontia":          ["features", "about", "testimonials", "faq", "form", "map"],
+    "harmonizacao facial": ["features", "gallery", "testimonials", "faq", "form"],
+    "dermatologia":        ["features", "about", "testimonials", "faq", "form"],
+    "psicologia":          ["features", "about", "testimonials", "faq", "form"],
+    "psiquiatria":         ["features", "about", "faq", "form"],
+    "fisioterapia":        ["features", "about", "testimonials", "faq", "form", "map"],
+    "nutricao":            ["features", "about", "testimonials", "faq", "form"],
+    "saude":               ["features", "about", "testimonials", "faq", "form", "map"],
+    "cardiologia":         ["features", "about", "testimonials", "faq", "form", "map"],
+    "pediatria":           ["features", "about", "testimonials", "faq", "form", "map"],
+    "veterinaria":         ["features", "about", "testimonials", "faq", "form", "map"],
+    "petshop":             ["features", "gallery", "testimonials", "form", "map"],
+    "farmacia":            ["features", "about", "testimonials", "faq", "map"],
+    "beleza":              ["features", "gallery", "testimonials", "pricing", "form", "map"],
+    "barbearia":           ["features", "gallery", "testimonials", "pricing", "form", "map"],
+    "lash design":         ["features", "gallery", "testimonials", "form", "map"],
+    "nail design":         ["features", "gallery", "testimonials", "pricing", "form", "map"],
+    "sobrancelhas":        ["features", "gallery", "testimonials", "form", "map"],
+    "estetica corporal":   ["features", "gallery", "testimonials", "pricing", "form"],
+    "spa":                 ["features", "gallery", "testimonials", "pricing", "form", "map"],
+    "fitness":             ["features", "pricing", "testimonials", "faq", "form", "map"],
+    "crossfit":            ["features", "pricing", "testimonials", "faq", "form", "map"],
+    "pilates":             ["features", "pricing", "about", "testimonials", "form", "map"],
+    "yoga":                ["features", "pricing", "about", "testimonials", "form", "map"],
+    "personal trainer":    ["features", "about", "testimonials", "pricing", "faq", "form"],
+    "gastronomia":         ["features", "gallery", "testimonials", "map"],
+    "hamburgueria":        ["features", "gallery", "testimonials", "map"],
+    "pizzaria":            ["features", "gallery", "testimonials", "map"],
+    "cafeteria":           ["features", "gallery", "testimonials", "map"],
+    "confeitaria":         ["features", "gallery", "testimonials", "form", "map"],
+    "construcao":          ["features", "gallery", "about", "testimonials", "form"],
+    "loja construcao":     ["features", "about", "testimonials", "form", "map"],
+    "arquitetura":         ["features", "gallery", "about", "testimonials", "form"],
+    "design interiores":   ["features", "gallery", "about", "testimonials", "form"],
+    "energia solar":       ["features", "about", "testimonials", "faq", "form"],
+    "reformas":            ["features", "gallery", "testimonials", "form"],
+    "moveis planejados":   ["features", "gallery", "testimonials", "faq", "form", "map"],
+    "imoveis":             ["features", "gallery", "about", "testimonials", "faq", "form"],
+    "imoveis alto padrao": ["features", "gallery", "about", "testimonials", "form"],
+    "contabilidade":       ["features", "about", "testimonials", "faq", "form"],
+    "financas":            ["features", "about", "testimonials", "faq", "form"],
+    "seguros":             ["features", "about", "testimonials", "faq", "form"],
+    "holding":             ["features", "about", "faq", "form"],
+    "tecnologia":          ["features", "about", "testimonials", "pricing", "faq", "form"],
+    "saas":                ["features", "pricing", "testimonials", "faq", "form"],
+    "desenvolvimento web": ["features", "gallery", "testimonials", "pricing", "form"],
+    "educacao":            ["features", "about", "testimonials", "pricing", "faq", "form"],
+    "curso online":        ["features", "about", "testimonials", "pricing", "faq", "form"],
+    "idiomas":             ["features", "pricing", "testimonials", "faq", "form"],
+    "marketing":           ["features", "about", "testimonials", "pricing", "faq", "form"],
+    "trafego pago":        ["features", "testimonials", "pricing", "faq", "form"],
+    "juridico":            ["features", "about", "testimonials", "faq", "form"],
+    "direito trabalhista": ["features", "about", "testimonials", "faq", "form"],
+    "turismo":             ["features", "gallery", "testimonials", "pricing", "form"],
+    "casamentos":          ["features", "gallery", "testimonials", "faq", "form"],
+    "fotografia":          ["features", "gallery", "testimonials", "pricing", "form"],
+    "infoprodutos":        ["features", "about", "testimonials", "pricing", "faq", "form"],
+    "lancamentos":         ["features", "testimonials", "countdown", "pricing", "faq", "form"],
+    "igreja":              ["features", "about", "testimonials", "map"],
+    "oficina":             ["features", "about", "testimonials", "faq", "form", "map"],
+    "estetica automotiva": ["features", "gallery", "testimonials", "pricing", "form", "map"],
+    "autopecas":           ["features", "about", "testimonials", "form", "map"],
+    "e-commerce":          ["features", "testimonials", "pricing", "faq", "form"],
+    "moda":                ["features", "gallery", "testimonials", "pricing", "form"],
+    "moda feminina":       ["features", "gallery", "testimonials", "pricing", "form"],
+}
+
+
 def build_sections(ctx: dict) -> list[dict]:
+    """Build niche-aware section list, then apply user overrides from prompt."""
+    niche = ctx.get("niche", "negocios")
+
+    default_body = NICHE_SECTION_DEFAULTS.get(niche, [
+        "features", "about", "testimonials", "faq", "form",
+    ])
+
     sections = [{"type": "header"}]
-    for i in range(ctx["banner_count"]):
+    for i in range(ctx.get("banner_count", 1)):
         sections.append({"type": "hero", "index": i})
-    if ctx["services"] or not ctx["sections_requested"]:
-        sections.append({"type": "features"})
-    if "about" in ctx["sections_requested"]:
-        sections.append({"type": "about"})
-    if ctx["wants_gallery"]:
-        sections.append({"type": "gallery"})
-    if ctx["wants_video"]:
-        sections.append({"type": "video"})
-    if ctx["wants_pricing"]:
-        sections.append({"type": "pricing"})
-    if ctx["testimonial_count"] > 0:
-        sections.append({"type": "testimonials"})
-    if "partners" in ctx["sections_requested"]:
+
+    for sec_type in default_body:
+        sections.append({"type": sec_type})
+
+    present = {s["type"] for s in sections}
+
+    # Apply explicit user requests
+    if ctx.get("wants_gallery") and "gallery" not in present:
+        idx = next((i for i, s in enumerate(sections) if s["type"] == "testimonials"), len(sections) - 1)
+        sections.insert(idx, {"type": "gallery"})
+        present.add("gallery")
+    if ctx.get("wants_video") and "video" not in present:
+        sections.insert(3, {"type": "video"})
+        present.add("video")
+    if ctx.get("wants_pricing") and "pricing" not in present:
+        idx = next((i for i, s in enumerate(sections) if s["type"] in ("testimonials", "form", "cta")), len(sections) - 1)
+        sections.insert(idx, {"type": "pricing"})
+        present.add("pricing")
+    if ctx.get("wants_faq") and "faq" not in present:
+        idx = next((i for i, s in enumerate(sections) if s["type"] in ("form", "map", "cta")), len(sections) - 1)
+        sections.insert(idx, {"type": "faq"})
+        present.add("faq")
+    if "about" in ctx.get("sections_requested", []) and "about" not in present:
+        sections.insert(3, {"type": "about"})
+        present.add("about")
+    if "partners" in ctx.get("sections_requested", []):
         sections.append({"type": "partners"})
-    if ctx["wants_faq"]:
-        sections.append({"type": "faq"})
-    if "countdown" in ctx["sections_requested"]:
-        sections.append({"type": "countdown"})
-    if ctx["wants_form"]:
-        sections.append({"type": "form"})
-    if ctx["wants_map"]:
+    if "countdown" in ctx.get("sections_requested", []) and "countdown" not in present:
+        sections.insert(2, {"type": "countdown"})
+
+    # Map: add if address/schedule found
+    if (ctx.get("wants_map") or ctx.get("address") or ctx.get("schedule")) and "map" not in present:
         sections.append({"type": "map"})
+    # Form: ensure present if lead capture needed
+    if ctx.get("wants_form") and "form" not in {s["type"] for s in sections}:
+        sections.append({"type": "form"})
+
     sections.append({"type": "cta"})
     sections.append({"type": "footer"})
-    return sections
 
+    # Deduplicate preserving order (keep hero duplicates for multi-banner)
+    seen: set[str] = set()
+    unique = []
+    for s in sections:
+        key = s["type"]
+        if key not in seen or key == "hero":
+            seen.add(key)
+            unique.append(s)
+    return unique
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HTML RENDERER
@@ -1716,19 +2264,19 @@ def render_html(ctx: dict, copy: dict, design: dict, sections: list[dict], logo_
     address = ctx.get("address", "")
     schedule = ctx.get("schedule", [])
 
-    css = _build_css(p, hf, bf)
+    css = _build_css(p, hf, bf, niche=ctx.get("niche", ""))
     body_parts = []
 
     for sec in sections:
         t = sec["type"]
         if t == "header":   body_parts.append(_sec_header(name, cta1, p, hf, wa, logo_url=logo_url))
         elif t == "hero":   body_parts.append(_sec_hero(copy, p, hf, bf, cta1, cta2, sec.get("index", 0), ctx))
-        elif t == "features": body_parts.append(_sec_features(copy["features"], p, hf, bf, name, ctx["audience"]))
-        elif t == "about":  body_parts.append(_sec_about(name, ctx["niche"], ctx["differentials"], p, hf, bf))
+        elif t == "features": body_parts.append(_sec_features(copy["features"], p, hf, bf, name, ctx["audience"], niche=ctx.get("niche", "")))
+        elif t == "about":  body_parts.append(_sec_about(name, ctx["niche"], ctx["differentials"], p, hf, bf, extra_info=ctx.get("extra_info", "") or ctx.get("custom_info", [""])[0] if ctx.get("custom_info") else "", location=ctx.get("location", "")))
         elif t == "gallery": body_parts.append(_sec_gallery(name, ctx["niche"], p, hf))
         elif t == "video":  body_parts.append(_sec_video(name, p, hf))
         elif t == "pricing": body_parts.append(_sec_pricing(copy["pricing"], p, hf, bf, cta1))
-        elif t == "testimonials": body_parts.append(_sec_testimonials(copy["testimonials"], p, hf, bf))
+        elif t == "testimonials": body_parts.append(_sec_testimonials(copy["testimonials"], p, hf, bf, niche=ctx.get("niche", "")))
         elif t == "partners": body_parts.append(_sec_partners(p, hf))
         elif t == "faq":    body_parts.append(_sec_faq(copy["faq"], p, hf, bf))
         elif t == "countdown": body_parts.append(_sec_countdown(p, hf, bf, cta1))
@@ -1755,7 +2303,7 @@ def render_html(ctx: dict, copy: dict, design: dict, sections: list[dict], logo_
     return html, css
 
 
-def _build_css(p, hf, bf):
+def _build_css(p, hf, bf, niche: str = ""):
     pri = p["primary"]
     acc = p["accent"]
     bg = p.get("bg", "#F7FAFC")
@@ -1855,7 +2403,220 @@ a{{text-decoration:none}}
   .hero h1{{font-size:1.7rem}}
   .btn-primary,.btn-outline,.btn-cta{{padding:14px 28px;font-size:.95rem}}
 }}
-"""
+""" + _niche_css_overrides(niche, pri, acc, bg, bg2, top, toa, txt, mut, hf, bf)
+
+
+# ── Niche-specific CSS overrides — visual identity per sector ─────────────────
+
+def _niche_css_overrides(niche: str, pri: str, acc: str, bg: str, bg2: str,
+                          top: str, toa: str, txt: str, mut: str, hf: str, bf: str) -> str:
+    """
+    Returns additional CSS classes that give each sector a unique visual identity.
+    Appended to the base CSS. Does NOT override — only adds specializations.
+    """
+    # Map niche to sector
+    SECTOR = {
+        # SAÚDE — clean, trust, calm blues/greens
+        "odontologia": "saude", "ortodontia": "saude", "dermatologia": "saude",
+        "psicologia": "saude", "psiquiatria": "saude", "fisioterapia": "saude",
+        "nutricao": "saude", "cardiologia": "saude", "ginecologia": "saude",
+        "pediatria": "saude", "veterinaria": "saude", "laboratorio": "saude",
+        "acupuntura": "saude", "fertilidade": "saude", "saude": "saude",
+        "harmonizacao facial": "estetica", "procedimentos esteticos": "estetica",
+        "estetica corporal": "estetica", "skincare": "estetica",
+        # BELEZA — elegante, rosé, gradient
+        "beleza": "beleza", "barbearia": "barbearia", "lash design": "beleza",
+        "nail design": "beleza", "sobrancelhas": "beleza", "maquiagem": "beleza",
+        "spa": "beleza", "depilacao": "beleza",
+        # FITNESS — energético, bold, escuro
+        "fitness": "fitness", "crossfit": "fitness", "pilates": "fitness",
+        "yoga": "fitness", "personal trainer": "fitness", "jiu-jitsu": "fitness",
+        "boxe": "fitness", "artes marciais": "fitness",
+        # FOOD — quente, apetitoso, textured
+        "gastronomia": "food", "hamburgueria": "food", "pizzaria": "food",
+        "cafeteria": "food", "confeitaria": "food", "sorveteria": "food",
+        "delivery": "food", "food truck": "food",
+        # MODA — clean, editorial, tipografia grande
+        "moda feminina": "moda", "moda masculina": "moda", "moda infantil": "moda",
+        "moda": "moda", "e-commerce": "moda",
+        # TECH — dark, neon accent, moderno
+        "tecnologia": "tech", "saas": "tech", "ia": "tech", "cybersecurity": "tech",
+        "desenvolvimento web": "tech", "app mobile": "tech", "software house": "tech",
+        "devops": "tech", "blockchain": "tech",
+        # JURÍDICO / FINANCEIRO — sóbrio, confiável
+        "juridico": "corporativo", "direito trabalhista": "corporativo",
+        "direito previdenciario": "corporativo", "direito familia": "corporativo",
+        "contabilidade": "corporativo", "financas": "corporativo",
+        "investimentos": "corporativo", "seguros": "corporativo",
+        "holding": "corporativo", "bpo financeiro": "corporativo",
+        # CONSTRUÇÃO — robusto, terroso
+        "construcao": "construcao", "loja construcao": "construcao",
+        "arquitetura": "construcao", "design interiores": "construcao",
+        "energia solar": "construcao", "reformas": "construcao",
+        "marcenaria": "construcao", "moveis planejados": "construcao",
+        # EDUCAÇÃO — vibrante, amigável
+        "educacao": "educacao", "curso online": "educacao", "idiomas": "educacao",
+        "mentoria": "educacao", "infoprodutos": "educacao",
+        "enem vestibular": "educacao", "lancamentos": "educacao",
+        # IMÓVEIS — premium, espacoso
+        "imoveis": "imoveis", "imoveis alto padrao": "imoveis",
+        # IGREJA — acolhedor, espiritual
+        "igreja": "igreja",
+    }
+
+    sector = SECTOR.get(niche, "")
+
+    extras = {
+        "saude": f"""
+/* Saúde: bordas suaves, ícone médico, cards com borda azul-esverdeada */
+.feature-card{{border-top:3px solid {acc};border-radius:12px}}
+.hero{{background:linear-gradient(150deg,{pri} 0%,{_darken(pri,0.1)} 60%,{_lighten(pri,0.05)} 100%)}}
+.section h2{{font-size:2rem;letter-spacing:-.5px}}
+.testimonial-card{{border-left:4px solid {acc};background:rgba(255,255,255,.07);border-radius:8px}}
+.faq-item{{border-left:3px solid {acc}}}
+.faq-q{{color:{pri}}}
+.btn-primary{{border-radius:50px}}
+.btn-cta{{border-radius:50px}}
+.nav-cta{{border-radius:50px}}
+""",
+        "estetica": f"""
+/* Estética: gradiente rose, bordas arredondadas, elegante */
+.hero{{background:linear-gradient(135deg,{pri} 0%,{_lighten(pri,0.1)} 50%,{_darken(pri,0.05)} 100%)}}
+.feature-card{{border-radius:20px;box-shadow:0 4px 20px rgba(0,0,0,.08)}}
+.btn-primary,.btn-cta,.nav-cta{{border-radius:50px;letter-spacing:.5px}}
+.section h2{{letter-spacing:-1px;font-size:2.4rem}}
+.gallery-item{{border-radius:20px;overflow:hidden}}
+""",
+        "beleza": f"""
+/* Beleza: clean, rosa suave, tipografia elegante */
+.hero{{background:linear-gradient(135deg,{pri} 0%,{_darken(pri,0.08)} 100%)}}
+.feature-card{{border-radius:20px;border-top:3px solid {acc}}}
+.btn-primary,.btn-cta,.nav-cta{{border-radius:50px}}
+.section h2{{letter-spacing:-1px}}
+.gallery-item{{border-radius:16px}}
+.testimonial-card{{border-radius:20px;border:1px solid rgba(255,255,255,.25)}}
+""",
+        "barbearia": f"""
+/* Barbearia: bold, dark, textura mascu */
+.hero{{background:linear-gradient(160deg,{pri} 0%,{_darken(pri,0.25)} 100%)}}
+.feature-card{{border-left:4px solid {acc};border-radius:4px;text-align:left}}
+.section h2{{text-transform:uppercase;letter-spacing:2px;font-size:1.8rem}}
+.btn-primary,.nav-cta{{border-radius:0px;text-transform:uppercase;letter-spacing:1px}}
+.btn-cta{{border-radius:0;text-transform:uppercase;letter-spacing:2px}}
+.testimonial-card{{border-left:3px solid {acc};border-radius:0}}
+""",
+        "fitness": f"""
+/* Fitness: bold, energético, angular */
+.hero{{background:linear-gradient(160deg,{_darken(pri,0.1)} 0%,{pri} 50%,{_darken(pri,0.2)} 100%)}}
+.feature-card{{border-radius:4px;border-bottom:4px solid {acc};text-align:left;padding-left:28px}}
+.section h2{{text-transform:uppercase;letter-spacing:1px;font-size:2rem}}
+.hero h1{{font-size:3.5rem;text-transform:uppercase;letter-spacing:-1px}}
+.btn-primary{{border-radius:0;text-transform:uppercase;letter-spacing:1px;padding:18px 56px}}
+.btn-cta{{border-radius:0;text-transform:uppercase;letter-spacing:2px}}
+.nav-cta{{border-radius:0;text-transform:uppercase;font-size:.8rem;letter-spacing:1px}}
+.stat-number{{font-size:3.5rem}}
+""",
+        "food": f"""
+/* Food: quente, apetitoso, arredondado */
+.hero{{background:linear-gradient(135deg,{_darken(pri,0.05)} 0%,{pri} 100%)}}
+.feature-card{{border-radius:16px;background:linear-gradient(135deg,#fff 0%,{bg} 100%)}}
+.feature-icon{{font-size:3rem}}
+.section h2{{font-size:2.5rem;letter-spacing:-1px}}
+.hero h1{{font-size:3.2rem}}
+.btn-primary{{border-radius:50px;font-size:1.1rem}}
+.btn-cta{{border-radius:50px}}
+.testimonial-card{{border-radius:16px;border:none;background:rgba(255,255,255,.12)}}
+.gallery-item{{border-radius:12px}}
+""",
+        "moda": f"""
+/* Moda: editorial, clean, tipografia grande */
+.hero{{background:{pri};padding:140px 48px 120px}}
+.hero h1{{font-size:3.8rem;letter-spacing:-2px;line-height:1.05}}
+.hero-badge{{display:none}}
+.feature-card{{border-radius:0;box-shadow:none;border:1px solid {bg2};border-radius:2px}}
+.section h2{{font-size:2.8rem;letter-spacing:-1.5px}}
+.btn-primary{{border-radius:0;text-transform:uppercase;letter-spacing:2px;font-size:.9rem}}
+.btn-cta{{border-radius:0;text-transform:uppercase;letter-spacing:2px}}
+.nav-cta{{border-radius:2px}}
+.gallery-item{{border-radius:0}}
+.pricing-card{{border-radius:0;border:1px solid {bg2}}}
+""",
+        "tech": f"""
+/* Tech: dark accent, futurista, neon */
+.hero{{background:linear-gradient(135deg,{pri} 0%,{_darken(pri,0.2)} 60%,{_darken(pri,0.1)} 100%)}}
+.feature-card{{background:#fff;border-top:2px solid {acc};border-radius:8px}}
+.section h2{{letter-spacing:-1px;font-size:2.3rem}}
+.hero h1{{font-size:3.2rem;letter-spacing:-1.5px}}
+.btn-primary{{border-radius:6px;background:linear-gradient(135deg,{acc},{_rotate_hue_css(acc,30)})}}
+.nav-cta{{border-radius:6px}}
+.testimonial-card{{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1)}}
+.stat-number{{font-size:3.5rem;background:linear-gradient(135deg,{acc},{_lighten(acc,0.3)});-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}}
+""",
+        "corporativo": f"""
+/* Corporativo/Jurídico: sóbrio, confiável, clássico */
+.hero{{background:linear-gradient(135deg,{pri} 0%,{_darken(pri,0.15)} 100%)}}
+.feature-card{{border-top:3px solid {acc};border-radius:4px}}
+.section h2{{font-size:2rem;letter-spacing:-.5px}}
+.btn-primary{{border-radius:4px}}
+.btn-cta{{border-radius:4px}}
+.faq-item{{border-left:3px solid {acc};border-radius:0 8px 8px 0}}
+.testimonial-card{{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12)}}
+""",
+        "construcao": f"""
+/* Construção: robusto, sólido, terroso */
+.hero{{background:linear-gradient(160deg,{pri} 0%,{_darken(pri,0.2)} 100%)}}
+.feature-card{{border-radius:4px;border-left:4px solid {acc};text-align:left}}
+.feature-icon{{font-size:2.2rem}}
+.section h2{{text-transform:uppercase;letter-spacing:1px;font-size:1.9rem}}
+.btn-primary{{border-radius:2px;text-transform:uppercase;letter-spacing:1px}}
+.btn-cta{{border-radius:2px;text-transform:uppercase;letter-spacing:1px}}
+.nav-cta{{border-radius:2px}}
+""",
+        "educacao": f"""
+/* Educação: vibrante, amigável, motivador */
+.hero{{background:linear-gradient(135deg,{pri} 0%,{_darken(pri,0.1)} 100%)}}
+.feature-card{{border-radius:16px;border-bottom:3px solid {acc}}}
+.section h2{{font-size:2.2rem}}
+.btn-primary{{border-radius:12px;font-size:1.1rem}}
+.btn-cta{{border-radius:12px}}
+.nav-cta{{border-radius:8px}}
+.testimonial-card{{border-radius:16px}}
+""",
+        "imoveis": f"""
+/* Imóveis: premium, espacoso, moderno */
+.hero{{background:linear-gradient(150deg,{pri} 0%,{_darken(pri,0.12)} 100%);padding:140px 48px 120px}}
+.hero h1{{font-size:3.4rem;letter-spacing:-1.5px}}
+.feature-card{{border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.1)}}
+.section h2{{font-size:2.4rem;letter-spacing:-1px}}
+.btn-primary{{border-radius:6px;padding:20px 56px}}
+.btn-cta{{border-radius:6px;padding:22px 64px}}
+.gallery-item{{border-radius:8px;height:240px}}
+""",
+        "igreja": f"""
+/* Igreja: acolhedor, espiritual, sereno */
+.hero{{background:linear-gradient(135deg,{pri} 0%,{_darken(pri,0.1)} 100%)}}
+.feature-card{{border-radius:16px;border-top:3px solid {acc}}}
+.section h2{{font-size:2rem;letter-spacing:-.5px}}
+.btn-primary,.btn-cta,.nav-cta{{border-radius:50px}}
+.testimonial-card{{border-radius:16px;border:1px solid rgba(255,255,255,.2)}}
+""",
+    }
+
+    return extras.get(sector, "")
+
+
+def _rotate_hue_css(hex_color: str, degrees: float) -> str:
+    """Rotate hue of hex color by degrees — for CSS gradient use."""
+    try:
+        import colorsys
+        h = hex_color.lstrip("#")
+        r, g, b = int(h[0:2], 16)/255, int(h[2:4], 16)/255, int(h[4:6], 16)/255
+        hh, s, v = colorsys.rgb_to_hsv(r, g, b)
+        hh = (hh + degrees / 360) % 1.0
+        r2, g2, b2 = colorsys.hsv_to_rgb(hh, s, v)
+        return f"#{int(r2*255):02X}{int(g2*255):02X}{int(b2*255):02X}"
+    except Exception:
+        return hex_color
 
 
 # ── Section renderers ─────────────────────────────────────────────────────────
@@ -1881,11 +2642,14 @@ def _sec_header(name, cta1, p, hf, wa, logo_url=None):
 
 def _sec_hero(copy, p, hf, bf, cta1, cta2, idx, ctx):
     niche = ctx["niche"]
+    btype = ctx.get("business_type", niche.capitalize())
     loc = f" em {ctx['location']}" if ctx["location"] else ""
     top = p.get("text_on_primary", "#FFFFFF")
     headline = copy["headline_variations"][idx % len(copy["headline_variations"])]
     subtitle = copy["subtitle"] if idx == 0 else f"Descubra tudo que {copy['display_name']} pode fazer por voce{loc}."
-    badge = f"Especialistas em {niche.capitalize()}{loc}"
+    # Use business_type for badge, not the generic niche slug
+    badge_text = btype if btype and btype.lower() != "empresa" else niche.capitalize()
+    badge = f"{badge_text}{loc}"
     return f"""
 <section class="hero" id="{'inicio' if idx == 0 else f'banner{idx+1}'}">
   <div class="hero-badge">{badge}</div>
@@ -1898,39 +2662,416 @@ def _sec_hero(copy, p, hf, bf, cta1, cta2, idx, ctx):
 </section>"""
 
 
-def _sec_features(features, p, hf, bf, name, audience):
-    cards = "".join(f'<div class="feature-card"><div class="feature-icon">{f["icon"]}</div><h3>{f["title"]}</h3><p>{f["desc"]}</p></div>' for f in features)
+def _sec_features(features, p, hf, bf, name, audience, niche=""):
+    NICHE_FEATURE_TITLE = {
+        "odontologia": "Nossos Tratamentos", "ortodontia": "Nossos Tratamentos",
+        "harmonizacao facial": "Nossos Procedimentos", "dermatologia": "Nossos Tratamentos",
+        "psicologia": "Como Podemos Te Ajudar", "fisioterapia": "Nossos Tratamentos",
+        "nutricao": "Nossos Servicos", "saude": "Nossos Servicos",
+        "fitness": "O que Oferecemos", "crossfit": "Nossa Programacao",
+        "pilates": "Nosso Metodo", "yoga": "Nossas Praticas",
+        "beleza": "Nossos Servicos", "barbearia": "Nossos Servicos",
+        "gastronomia": "Nosso Menu", "hamburgueria": "Nosso Cardapio",
+        "pizzaria": "Nosso Cardapio", "cafeteria": "Nosso Menu",
+        "confeitaria": "Nossos Doces", "loja construcao": "Nosso Estoque",
+        "autopecas": "Nossas Pecas", "farmacia": "Nossos Produtos",
+        "moda feminina": "Nossas Colecoes", "moda masculina": "Nossas Colecoes",
+        "moda": "Nossas Colecoes", "e-commerce": "Nossos Produtos",
+        "veterinaria": "Nossos Servicos Veterinarios", "petshop": "Nossos Servicos",
+        "turismo": "Nossos Destinos e Servicos", "casamentos": "Nossos Servicos",
+        "imoveis": "O que Oferecemos", "contabilidade": "Nossos Servicos",
+        "tecnologia": "Nossas Solucoes", "saas": "Nossas Funcionalidades",
+        "marketing": "Nossas Solucoes", "juridico": "Nossas Areas de Atuacao",
+        "educacao": "O que Voce Vai Aprender", "curso online": "O que Voce Vai Aprender",
+        "infoprodutos": "O que Esta Incluido", "lancamentos": "O que Esta Incluido",
+        "energia solar": "Nossas Solucoes em Energia Solar",
+        "construcao": "Nossos Servicos", "arquitetura": "Nossos Servicos",
+        "igreja": "Nossa Programacao", "oficina": "Nossos Servicos",
+    }
+    title = NICHE_FEATURE_TITLE.get(niche, f"Por que escolher o {name}?")
+    subtitle = f"Tudo que voce precisa em um so lugar para {audience}"
+    cards = "".join(
+        f'<div class="feature-card"><div class="feature-icon">{f["icon"]}</div><h3>{f["title"]}</h3><p>{f["desc"]}</p></div>'
+        for f in features
+    )
     return f"""
 <section class="section section-alt" id="servicos">
-  <h2>Por que escolher o {name}?</h2>
-  <p class="subtitle">Solucoes completas para {audience}</p>
+  <h2>{title}</h2>
+  <p class="subtitle">{subtitle}</p>
   <div class="features-grid">{cards}</div>
 </section>"""
 
 
-def _sec_about(name, niche, diffs, p, hf, bf):
-    diff_items = "".join(f"<li style='padding:6px 0;color:#4a5568'>checkmark {d}</li>" for d in diffs) if diffs else "<li style='padding:6px 0;color:#4a5568'>checkmark Qualidade comprovada</li>"
+
+# Niche-specific about texts — (specialty, mission)
+_ABOUT_TEXT = {
+    # SAÚDE
+    "odontologia": ("odontologia com tecnologia de ponta e atendimento humanizado",
+                    "Cuidamos do seu sorriso com técnicas modernas, garantindo conforto, estetica e resultados duradouros."),
+    "ortodontia": ("ortodontia com tratamentos personalizados e tecnologia digital",
+                   "Alinhamos sorrisos com alinhadores e aparelhos de ultima geracao, respeitando o ritmo de cada paciente."),
+    "harmonizacao facial": ("harmonizacao facial com resultados naturais e seguros",
+                            "Valorizamos sua beleza natural com procedimentos esteticos minimamente invasivos realizados por profissionais certificados."),
+    "dermatologia": ("dermatologia clinica e estetica com diagnostico preciso",
+                     "Cuidamos da saude e beleza da sua pele com tratamentos baseados em evidencias e tecnologia de ponta."),
+    "psicologia": ("psicologia com abordagem acolhedora, etica e humanizada",
+                   "Acreditamos que saude mental e fundamental. Oferecemos espaco seguro para autoconhecimento e transformacao."),
+    "psiquiatria": ("psiquiatria com atendimento sigiloso e tratamento individualizado",
+                    "Abordagem integrativa e humanizada para transtornos do humor, ansiedade, TDAH e outros diagnosticos."),
+    "fisioterapia": ("fisioterapia com reabilitacao completa e equipamentos modernos",
+                     "Nossa equipe devolve qualidade de vida com protocolos individualizados para cada tipo de lesao e objetivo."),
+    "nutricao": ("nutricao clinica e esportiva com plano 100% personalizado",
+                 "Transformamos sua relacao com a comida para voce atingir seus objetivos com saude e sem restricoes desnecessarias."),
+    "saude": ("medicina com atendimento humanizado e diagnostico preciso",
+              "Nossa equipe de profissionais de saude cuida de voce com dedicacao, tecnologia e abordagem preventiva."),
+    "cardiologia": ("cardiologia com diagnostico precoce e prevencao cardiovascular",
+                    "Cuidamos do seu coracao com exames modernos, acompanhamento continuo e orientacao de estilo de vida saudavel."),
+    "ginecologia": ("ginecologia e obstetricia com atendimento integral a saude feminina",
+                    "Da adolescencia a menopausa, cuidamos de voce em todas as fases com respeito e expertise."),
+    "pediatria": ("pediatria com atendimento especializado para criancas e adolescentes",
+                  "Cuidamos da saude dos pequenos com carinho, tecnica e orientacao completa para as familias."),
+    "veterinaria": ("medicina veterinaria com cuidado e amor pelos animais",
+                    "Tratamos seus pets como membros da familia com diagnosticos precisos, cirurgias seguras e cuidados humanizados."),
+    "laboratorio": ("laboratorio de analises clinicas com resultados rapidos e precisos",
+                    "Exames realizados com equipamentos de ultima geracao, laudo digital e coleta domiciliar disponivel."),
+    "acupuntura": ("acupuntura e medicina tradicional chinesa com abordagem integrativa",
+                   "Equilibramos corpo e mente atraves de tecnicas milenares para alivio de dor e bem-estar geral."),
+    "fertilidade": ("medicina reprodutiva com tecnologia de reproducao assistida de ponta",
+                    "Realizamos o sonho de constituir familia com tratamentos personalizados e suporte emocional em cada etapa."),
+    # ESTÉTICA / BELEZA
+    "beleza": ("beleza e bem-estar com profissionais especializados e produtos premium",
+               "Cuidamos da sua beleza com as melhores tecnicas do mercado, produtos de alta qualidade e atendimento personalizado."),
+    "barbearia": ("barbearia moderna com os melhores profissionais do estilo masculino",
+                  "Combinamos tradicao e modernidade para entregar o corte e barba perfeitos. Ambiente masculino exclusivo."),
+    "lash design": ("extensao de cilios e lash design com tecnica profissional",
+                    "Cada par de cilios e aplicado com precisao milimetrica para realcar seu olhar com naturalidade e durabilidade."),
+    "nail design": ("nail design com unhas em gel, acrilica e nail art personalizadas",
+                    "Arte e cuidado para suas maos e pes com as melhores marcas e tecnicas de nail design do mercado."),
+    "sobrancelhas": ("design de sobrancelhas e micropigmentacao facial profissional",
+                     "Emolduramos seu rosto realcando sua beleza natural com tecnicas de design e pigmentacao precisas."),
+    "maquiagem": ("maquiagem profissional para noivas, festas e eventos especiais",
+                  "Valorizamos seus tracos com maquiagem artistica que dura o dia todo, do pre-making ao retoque final."),
+    "estetica corporal": ("estetica corporal com tratamentos corporais avancados",
+                          "Tratamentos de reducao de medidas, drenagem linfatica e modelagem corporal com tecnologias modernas."),
+    "spa": ("spa e bem-estar com experiencias relaxantes e rejuvenescedoras",
+            "Um oasis de tranquilidade onde cada tratamento e pensado para restaurar seu equilibrio fisico e mental."),
+    "skincare": ("skincare com formulas dermato testadas e ingredientes ativos",
+                 "Desenvolvemos rotinas de cuidado com a pele personalizadas para sua pele funcionar no melhor estado possivel."),
+    "depilacao": ("depilacao a laser e tratamentos definitivos com tecnologia avancada",
+                  "Livre-se dos pelos indesejados com seguranca, eficacia e o minimo de desconforto possivel."),
+    # FITNESS
+    "fitness": ("academia com metodologia comprovada e equipamentos modernos",
+                "Transformamos vidas atraves do exercicio fisico com instrutores certificados e planos de treino individualizados."),
+    "crossfit": ("CrossFit com coaches certificados e comunidade motivadora",
+                 "Superamos limites juntos com treinos funcionais de alta intensidade que transformam corpo, mente e habitos."),
+    "pilates": ("pilates com metodo original e instrutores especializados",
+                "O metodo Pilates transforma sua postura, alivia dores cronicas e conecta voce com seu corpo de forma unica."),
+    "yoga": ("yoga e meditacao para equilibrio corpo-mente",
+             "Praticas milenares adaptadas ao cotidiano moderno para reduzir estresse, melhorar flexibilidade e qualidade de vida."),
+    "personal trainer": ("personal training 100% personalizado para seus objetivos",
+                         "Cada treino e criado especificamente para voce, com acompanhamento presencial ou online e resultados reais."),
+    "jiu-jitsu": ("jiu-jitsu brasileiro com professores faixa preta experientes",
+                  "Arte marcial que desenvolve tecnica, disciplina e autoconfianca para criancas, adultos e atletas."),
+    "boxe": ("boxe e muay thai para condicao fisica e defesa pessoal",
+             "Treinamento de alta performance que combina tecnica de luta, condicionamento fisico e autodefesa pratica."),
+    # IMOBILIÁRIO
+    "imoveis": ("mercado imobiliario com carteira exclusiva e atendimento personalizado",
+                "Ajudamos voce a encontrar o imovel ideal com transparencia total, suporte juridico e as melhores condicoes."),
+    "imoveis alto padrao": ("imoveis de luxo com consultoria exclusiva e total discrição",
+                            "Curadoria de residencias premium com atendimento VIP e acesso a lancamentos antes do mercado."),
+    # FINANCEIRO
+    "contabilidade": ("contabilidade estrategica para empresas que querem crescer",
+                      "Alem dos numeros, entregamos inteligencia fiscal e financeira para sua empresa pagar menos impostos legalmente."),
+    "financas": ("consultoria financeira pessoal e empresarial com resultados comprovados",
+                 "Ajudamos pessoas e empresas a organizar, investir e crescer com planejamento financeiro personalizado."),
+    "investimentos": ("consultoria de investimentos com gestao profissional de carteira",
+                      "Protegemos e multiplicamos seu patrimonio com estrategia diversificada e monitoramento constante."),
+    "seguros": ("corretora de seguros com as melhores coberturas e custo-beneficio",
+                "Protegemos o que voce mais valoriza com seguros personalizados para cada etapa da sua vida."),
+    "holding": ("holding patrimonial para protecao e planejamento sucessorio",
+                "Estruturamos seu patrimonio de forma inteligente para protege-lo, reduzir impostos e garantir o futuro da familia."),
+    "bpo financeiro": ("BPO financeiro para empresas que querem foco no seu negocio",
+                       "Assumimos toda a gestao financeira da sua empresa com equipe especializada e tecnologia moderna."),
+    # TECNOLOGIA
+    "tecnologia": ("tecnologia e inovacao que transformam negocios e processos",
+                   "Desenvolvemos solucoes digitais personalizadas que aumentam eficiencia, reduzem custos e geram crescimento."),
+    "saas": ("plataforma SaaS escalavel para empresas em crescimento",
+             "Nossa plataforma automatiza processos, centraliza dados e entrega insights para voce tomar decisoes mais rapidas."),
+    "ia": ("inteligencia artificial e machine learning para vantagem competitiva",
+           "Desenvolvemos solucoes de IA personalizadas que automatizam tarefas, analisam dados e geram valor real para seu negocio."),
+    "cybersecurity": ("seguranca digital e protecao de dados para empresas",
+                      "Protegemos sua infraestrutura digital com pentest, monitoramento continuo e conformidade com LGPD."),
+    "desenvolvimento web": ("desenvolvimento web com tecnologias modernas e performance",
+                            "Criamos sites e sistemas rapidos, seguros e responsivos que convertem visitantes em clientes."),
+    "app mobile": ("desenvolvimento de aplicativos iOS e Android de alta qualidade",
+                   "Apps intuitivos, performaticos e escalaves desenvolvidos com metodologia agil e foco na experiencia do usuario."),
+    "software house": ("fabrica de software para solucoes customizadas e escalaves",
+                       "Transformamos suas necessidades em solucoes tecnologicas com qualidade, prazo e suporte continuo."),
+    # EDUCAÇÃO
+    "educacao": ("educacao com metodologia focada em resultados praticos e mercado",
+                 "Preparamos nossos alunos para os desafios reais com conteudo atual, professores experientes e certificacao."),
+    "curso online": ("cursos online que transformam carreiras e vidas",
+                     "Aprenda no seu ritmo com metodologia comprovada, comunidade ativa e certificado reconhecido pelo mercado."),
+    "idiomas": ("escola de idiomas com metodo comunicativo e resultados rapidos",
+                "Desenvolvemos fluencia real atraves de metodologia comunicativa, professores qualificados e pratica constante."),
+    "mentoria": ("mentoria profissional intensiva com especialistas do mercado",
+                 "Aceleramos seu desenvolvimento com acompanhamento proximo, estrategia personalizada e rede de contatos."),
+    "enem vestibular": ("preparatorio ENEM e vestibular com metodologia de aprovacao",
+                        "Nossos alunos passam nos melhores vestibulares com nossa metodologia focada em simulados e revisao estrategica."),
+    # MARKETING
+    "marketing": ("agencia de marketing digital com foco em resultados mensuraveis",
+                  "Estrategia, conteudo e gestao de campanhas integradas para sua marca crescer de forma consistente e escalavel."),
+    "trafego pago": ("gestao de trafego pago com ROI comprovado e gestao transparente",
+                     "Gerenciamos seu investimento em anuncios com eficiencia maxima, relatorios claros e foco em leads qualificados."),
+    "social media": ("gestao de redes sociais com estrategia e producao de conteudo",
+                     "Construimos presenca digital solida com conteudo relevante, engajamento real e crescimento consistente."),
+    "seo": ("consultoria SEO para posicionamento organico no Google",
+            "Posicionamos sua empresa nos primeiros resultados do Google com tecnicas sustentaveis de SEO on e off-page."),
+    "branding": ("branding e identidade visual para marcas que querem ser lembradas",
+                 "Criamos identidades visuais estrategicas que comunicam os valores da sua marca e conectam com seu publico."),
+    "lancamentos": ("especialista em lancamentos digitais de alto impacto",
+                    "Metodologia de lancamento que gera faturamento expressivo em poucos dias, com estrutura e previsibilidade."),
+    # JURÍDICO
+    "juridico": ("advocacia com experiencia comprovada e atendimento personalizado",
+                 "Defendemos seus direitos com tecnica, etica e total comprometimento, buscando sempre o melhor resultado."),
+    "direito trabalhista": ("direito trabalhista com defesa efetiva dos seus direitos",
+                            "Atuamos em acoes trabalhistas para garantir o que voce tem direito: verbas, adicionais e indenizacoes."),
+    "direito previdenciario": ("direito previdenciario para conquista e revisao de beneficios INSS",
+                               "Especialistas em aposentadorias, auxilio-doenca, BPC/LOAS e revisao de beneficios negados."),
+    "direito familia": ("direito de familia com atendimento sigiloso e humano",
+                        "Acompanhamento juridico em divorcios, guarda de filhos, pensao alimenticia e inventarios."),
+    # AUTOMOTIVO
+    "oficina": ("oficina mecanica com diagnostico preciso e garantia nos servicos",
+                "Cuidamos do seu veiculo com transparencia total, tecnologia de diagnostico e maos de obra qualificada."),
+    "estetica automotiva": ("estetica automotiva de nivel profissional para seu carro brilhar",
+                            "Polimento, vitrificacao e higienizacao realizados com produtos premium e tecnica milimetrica."),
+    "lava rapido": ("lava rapido com lavagem profissional rapida e de qualidade",
+                    "Lavagem completa com agilidade e resultado impecavel, usando produtos especificos para cada superficie."),
+    # CONSTRUÇÃO CIVIL
+    "energia solar": ("energia solar com instalacao certificada e garantia de economia",
+                      "Reduzimos sua conta de luz em ate 95% com paineis de alta eficiencia, monitoramento online e suporte tecnico."),
+    "construcao": ("construcao civil com qualidade comprovada e prazo garantido",
+                   "Cada obra e unica. Nossa equipe de engenheiros e mestres de obras entrega no prazo e dentro do orcamento."),
+    "arquitetura": ("arquitetura e projetos que transformam espacos em experiencias",
+                    "Criamos espacos funcionais e esteticamente belos que refletem a identidade de quem vai viver ou trabalhar neles."),
+    "design interiores": ("design de interiores com conceito exclusivo e execucao perfeita",
+                          "Transformamos ambientes com projeto de interiores que equilibra estetica, funcionalidade e seu estilo de vida."),
+    "moveis planejados": ("moveis planejados sob medida para aproveitar cada centimetro",
+                          "Projetamos e fabricamos moveis que se adaptam perfeitamente ao espaco, ao seu estilo e ao seu orcamento."),
+    "reformas": ("empresa de reformas residenciais e comerciais de alto padrao",
+                 "Executamos reformas completas ou por etapas com equipe propria, materiais de qualidade e acabamento impecavel."),
+    "loja construcao": ("loja de materiais de construcao com o maior estoque da regiao",
+                        "Atendemos construtores, engenheiros, arquitetos e autoempreendedores com os melhores materiais e preco justo."),
+    "marcenaria": ("marcenaria sob medida para moveis e projetos especiais",
+                   "Fabricamos pecas em madeira macica e MDF com precisao artesanal e acabamento de nivel profissional."),
+    # ALIMENTAÇÃO
+    "gastronomia": ("gastronomia com ingredientes frescos e receitas exclusivas",
+                    "Cada prato e preparado com dedicacao e ingredientes selecionados para proporcionar uma experiencia gastronomica inesquecivel."),
+    "hamburgueria": ("hamburgueria artesanal com blend exclusivo de carnes nobres",
+                     "Hamburguer feito na hora, com ingredientes frescos e receitas proprias criadas com paixao e tecnica."),
+    "pizzaria": ("pizzaria artesanal com massa fermentada e ingredientes premium",
+                 "Nossa pizza e feita com massa de longa fermentacao, molho caseiro e ingredientes selecionados para sabor autentico."),
+    "cafeteria": ("cafeteria especializada em cafe especial e experiencias aconchegantes",
+                  "Cada xcara e cuidadosamente preparada por baristas treinados com graos de origem para o melhor sabor."),
+    "confeitaria": ("confeitaria artesanal com bolos personalizados e doces finos",
+                    "Criamos doces que sao obras de arte comestiveis, preparados com ingredientes premium e muito amor."),
+    "delivery": ("delivery de comida saborosa e saudavel com entrega rapida",
+                 "Refeicoes preparadas com carinho, entregues quentes e dentro do prazo para voce curtir em casa."),
+    # E-COMMERCE / MODA
+    "moda feminina": ("moda feminina com pecas exclusivas e qualidade premium",
+                      "Curadoria de pecas que combinam tendencia, conforto e personalidade para mulheres que tem estilo."),
+    "moda masculina": ("moda masculina com estilo contemporaneo e qualidade comprovada",
+                       "Roupas e acessorios que comunicam personalidade, para o homem que se veste com atencao aos detalhes."),
+    "moda infantil": ("moda infantil com conforto, seguranca e estilo",
+                      "Roupinhas lindas, confortaveis e com tecidos seguros para os pequenos se expressarem com estilo."),
+    "moda": ("loja de moda com curadoria especial para todos os estilos",
+             "Pecas selecionadas com atencao a qualidade, caimento e tendencia para voce se sentir incrivel todos os dias."),
+    "e-commerce": ("loja online com catalogo completo e entrega rapida",
+                   "Compra segura, frete acessivel e produto de qualidade entregue no conforto da sua casa."),
+    # PET
+    "petshop": ("pet shop completo para o bem-estar do seu animal de estimacao",
+                "Tudo para o seu pet em um so lugar: banho, tosa, racao, acessorios e muito amor pelos animais."),
+    "hotel pet": ("hotel para pets com cuidados individualizados e webcam ao vivo",
+                  "Seu pet fica em ambiente seguro, confortavel e cheio de carinho enquanto voce viaja sem preocupacao."),
+    "adestramento": ("adestramento profissional com metodos positivos e humanizados",
+                     "Desenvolvemos o comportamento do seu pet com tecnicas baseadas em reforcamento positivo e paciencia."),
+    # TURISMO
+    "turismo": ("agencia de viagens com roteiros exclusivos e atendimento dedicado",
+                "Planejamos cada detalhe da sua viagem para voce vivenciar experiencias inesqueciveis sem estresse."),
+    "turismo luxo": ("turismo de luxo com curadoria de experiencias exclusivas",
+                     "Viagens premium com hoteis 5 estrelas, transfers privados e acesso a experiencias unicas pelo mundo."),
+    "hospedagem": ("hospedagem aconchegante com ótimo custo-beneficio",
+                   "Quartos confortaveis, cafe da manha caprichado e localizacao estrategica para sua estadia perfeita."),
+    # EVENTOS
+    "casamentos": ("cerimonial de casamentos com atencao a cada detalhe",
+                   "Realizamos o casamento dos seus sonhos com planejamento impecavel, execucao precisa e muita emocao."),
+    "fotografia": ("fotografia profissional que eterniza seus momentos mais especiais",
+                   "Imagens que contam historias com sensibilidade artistica, luz perfeita e equipamentos profissionais."),
+    "buffet": ("buffet gourmet para eventos memoraveis de todos os portes",
+               "Cardapio variado e sofisticado preparado por chefs experientes para encantar todos os convidados."),
+    # INFOPRODUTOS
+    "infoprodutos": ("produtor de infoprodutos e cursos digitais que transformam vidas",
+                     "Conteudo de qualidade, metodologia testada e suporte real para quem quer aprender e aplicar com resultado."),
+    "curso online": ("cursos online que entregam conhecimento pratico e transformacao real",
+                     "Aprenda com quem tem resultado, aplique imediatamente e conquiste seus objetivos com nossa metodologia."),
+    # RELIGIOSO
+    "igreja": ("comunidade crista acolhedora e transformadora",
+               "Uma familia que te recebe de bracos abertos com fe, proposito, louvor e mensagem que transforma vidas."),
+    # LOJAS ESPECIALIZADAS
+    "farmacia": ("farmacia com atendimento farmaceutico especializado e humanizado",
+                 "Nosso compromisso e com sua saude e bem-estar, com orientacao profissional para uso correto dos medicamentos."),
+    "autopecas": ("loja de autopecas com estoque completo para todas as marcas",
+                  "Pecas originais e paralelas de qualidade para mecanicos e proprietarios, com entrega rapida e preco justo."),
+    "optica": ("otica com exame de vista gratuito e os melhores modelos",
+               "Encontre os oculos perfeitos para seu rosto, seu estilo e sua visao com auxilio de optometristas qualificados."),
+    "floricultura": ("floricultura com arranjos florais para todas as ocasioes",
+                     "Flores frescas selecionadas diariamente para presentear, decorar e expressar sentimentos com arte floral."),
+    "loja moveis": ("loja de moveis com design moderno e excelente custo-beneficio",
+                    "Ambiente, conforto e estilo para todos os comodos da sua casa com qualidade que dura anos."),
+    "papelaria": ("papelaria completa para escola, escritorio e presentear",
+                  "Material escolar, de escritorio, impressao e artigos para presente em um so lugar com preco acessivel."),
+    # RH / LOGÍSTICA
+    "rh": ("consultoria de RH para contratar e reter os melhores talentos",
+           "Recrutamento estrategico, avaliacao por competencias e desenvolvimento de pessoas para empresas que crescem."),
+    "logistica": ("logistica e transporte de cargas com seguranca e pontualidade",
+                  "Soluções completas de frete, armazenagem e distribuicao para sua empresa funcionar sem interrupcoes."),
+    # CONSULTORIA
+    "consultoria": ("consultoria empresarial estrategica para empresas em crescimento",
+                    "Analise profunda do seu negocio com solucoes praticas para aumentar eficiencia, lucro e escalabilidade."),
+}
+
+
+def _sec_about(name, niche, diffs, p, hf, bf, extra_info="", location=""):
+    diff_items = "".join(
+        f"<li style='padding:6px 0;color:#4a5568'>✓ {d}</li>" for d in diffs
+    ) if diffs else "<li style='padding:6px 0;color:#4a5568'>✓ Qualidade comprovada</li>"
+
+    desc = _ABOUT_TEXT.get(niche)
+    if desc:
+        specialty, mission = desc
+        p1 = f"O {name} é especialista em {specialty}."
+        p2 = mission
+    else:
+        # Generic but better fallback based on niche sector
+        NICHE_SECTOR_ABOUT = {
+            "saas": ("plataforma digital escalavel", "Automatizamos processos e entregamos tecnologia de ponta para empresas que querem crescer mais rapido."),
+            "marketing": ("marketing digital com foco em performance", "Estrategia, conteudo e campanhas integradas para sua marca crescer de forma consistente."),
+            "lancamentos": ("lancamentos digitais de alto impacto", "Metodologia comprovada que gera faturamento expressivo com estrutura e previsibilidade."),
+            "infoprodutos": ("infoprodutos e cursos digitais", "Conteudo de qualidade com metodologia testada para quem quer aprender e ter resultado real."),
+            "turismo luxo": ("turismo de luxo e experiencias exclusivas", "Curadoria de viagens premium com hoteis 5 estrelas e acesso a experiencias unicas pelo mundo."),
+            "casamentos": ("cerimonial e assessoria de casamentos", "Realizamos o casamento dos seus sonhos com planejamento impecavel e atencao a cada detalhe."),
+            "fotografia": ("fotografia profissional de eventos e retratos", "Capturamos momentos com sensibilidade artistica e qualidade tecnica para eternizar memorias."),
+            "petshop": ("pet shop completo com foco no bem-estar animal", "Tudo para seu pet em um so lugar com profissionais que realmente amam os animais."),
+            "hotel pet": ("hotel para pets com cuidados individualizados", "Seu pet fica em ambiente seguro e confortavel com acompanhamento 24h e webcam ao vivo."),
+            "hamburgueria": ("hamburgueria artesanal com blend exclusivo", "Hamburguer feito na hora com ingredientes frescos e receitas proprias criadas com paixao."),
+            "pizzaria": ("pizzaria artesanal com massa de longa fermentacao", "Pizza autentica com massa artesanal, molho caseiro e ingredientes premium selecionados."),
+            "cafeteria": ("cafeteria especializada em cafe especial", "Cada xcara preparada por baristas treinados com graos de origem para o melhor sabor."),
+            "confeitaria": ("confeitaria artesanal com bolos personalizados", "Doces que sao obras de arte preparados com ingredientes premium e muito carinho."),
+        }
+        fb = NICHE_SECTOR_ABOUT.get(niche)
+        if fb:
+            specialty, mission = fb
+            p1 = f"O {name} é especialista em {specialty}."
+            p2 = mission
+        else:
+            p1 = f"O {name} é referencia em {niche} com anos de experiencia no mercado."
+            p2 = "Nossa equipe dedicada garante o melhor atendimento e resultados que superam suas expectativas em cada projeto."
+
+    # Enrich with real data from prompt if available
+    loc_txt = f" em {location}" if location else ""
+    p1 = p1.replace(f"O {name} é", f"O {name} é uma referencia consolidada{loc_txt} — " if location else f"O {name} é")
+
+    # Add extra_info as a third paragraph if available and substantive
+    extra_para = ""
+    if extra_info and len(extra_info) > 20:
+        extra_para = f"<p>{extra_info}</p>"
+
     return f"""
 <section class="section" id="sobre">
   <div class="about-inner">
     <div class="about-text">
       <h2>Sobre o {name}</h2>
-      <p>Somos especialistas em {niche} com anos de experiencia no mercado. Nossa missao e oferecer solucoes de alta qualidade que transformam a vida dos nossos clientes.</p>
-      <p>Com uma equipe dedicada e metodologia comprovada, garantimos resultados excepcionais em cada projeto.</p>
+      <p>{p1}</p>
+      <p>{p2}</p>
+      {extra_para}
       <ul style="list-style:none;margin-top:16px">{diff_items}</ul>
     </div>
-    <div class="about-visual">building</div>
+    <div class="about-visual">🏆</div>
   </div>
 </section>"""
 
 
 def _sec_gallery(name, niche, p, hf):
-    items = "".join(f'<div class="gallery-item">image</div>' for i in range(6))
+    # Niche-specific gallery labels and emojis instead of generic "image"
+    NICHE_GALLERY: dict[str, list[str]] = {
+        "odontologia":       ["😁 Sorriso Transformado", "🦷 Implante", "✨ Clareamento", "💎 Facetas", "😁 Antes e Depois", "🏆 Resultado Final"],
+        "harmonizacao facial": ["✨ Harmonizacao", "💆 Preenchimento", "👄 Labios", "✨ Botox", "💎 Resultado", "🌟 Antes e Depois"],
+        "beleza":            ["💇 Coloracao", "✂️ Corte", "💅 Unhas", "💄 Maquiagem", "✨ Escova", "🌟 Transformacao"],
+        "barbearia":         ["✂️ Corte Masculino", "🪒 Barba Feita", "💈 Estilo", "👑 VIP", "✂️ Acabamento", "🏆 Resultado"],
+        "lash design":       ["👁️ Fio a Fio", "✨ Volume Russo", "💎 Mega Volume", "👁️ Lash Lifting", "✨ Natural", "🌟 Marcante"],
+        "fitness":           ["💪 Musculacao", "🏋️ Funcional", "🔥 HIIT", "🎯 Aula Coletiva", "⚡ Resultado", "🏆 Transformacao"],
+        "crossfit":          ["🔥 WOD", "💪 Levantamento", "⚡ Ginastica", "🏆 Competicao", "🎯 Treino", "🚀 Performance"],
+        "pilates":           ["🧘 Solo", "🎯 Aparelhos", "💚 Gestantes", "✨ Clinico", "🌟 Postura", "❤️ Resultado"],
+        "gastronomia":       ["🍽️ Prato Principal", "🥗 Entrada", "🍷 Harmonizacao", "👨‍🍳 Chef", "🌟 Sobremesa", "✨ Ambiente"],
+        "hamburgueria":      ["🍔 Artesanal", "🔥 Smash Burger", "🍟 Batata Frita", "😋 Combo", "🏆 Especial", "❤️ Favorito"],
+        "pizzaria":          ["🍕 Margherita", "🍕 Especial", "🍕 Forno a Lenha", "🍕 Borda Recheada", "🍕 Artesanal", "🌟 Chef"],
+        "cafeteria":         ["☕ Espresso", "🧁 Croissant", "☕ Cappuccino", "🍰 Brunch", "☕ Cold Brew", "✨ Ambiente"],
+        "confeitaria":       ["🎂 Bolo Personalizado", "🧁 Cupcake", "💎 Cake Design", "🎀 Doces Finos", "🎂 Casamento", "✨ Arte"],
+        "imoveis":           ["🏠 Residencial", "🏢 Comercial", "🏡 Casa", "🏰 Cobertura", "🔑 Entrega", "✨ Interior"],
+        "construcao":        ["🏗️ Fundacao", "🧱 Estrutura", "🔨 Acabamento", "🏠 Entrega", "✨ Interior", "🏆 Obra Concluida"],
+        "arquitetura":       ["📐 Projeto", "🏠 Render 3D", "✨ Interiores", "🔑 Entrega", "🌟 Antes", "🏆 Depois"],
+        "design interiores": ["🛋️ Sala", "🛏️ Quarto", "🍳 Cozinha", "🏠 Home Office", "✨ Detalhe", "🌟 Resultado"],
+        "moveis planejados": ["🪑 Sala", "🛏️ Closet", "🍳 Cozinha", "💻 Home Office", "🚿 Banheiro", "✨ Detalhe"],
+        "moda feminina":     ["👗 Nova Colecao", "👠 Calcados", "👜 Bolsas", "✨ Look Completo", "💃 Estilo", "🌟 Tendencia"],
+        "moda masculina":    ["👔 Camisas", "👖 Calcas", "🧥 Blazer", "👟 Calcados", "✨ Look", "🌟 Estilo"],
+        "moda":              ["✨ Lancamento", "💃 Look Feminino", "👔 Look Masculino", "👟 Calcados", "👜 Acessorios", "🌟 Colecao"],
+        "veterinaria":       ["🐕 Consulta", "🐈 Gato", "💉 Vacinacao", "🏥 Cirurgia", "❤️ Cuidado", "🌟 Recuperado"],
+        "petshop":           ["🐩 Tosa Artistica", "🛁 Banho", "🎀 Acessorios", "🐾 Hidratacao", "🌟 Resultado", "❤️ Feliz"],
+        "fotografia":        ["📷 Retrato", "💍 Casamento", "🎓 Formatura", "👶 Gestante", "🏢 Corporativo", "🌟 Arte"],
+        "casamentos":        ["💍 Cerimonia", "💐 Decoracao", "🎂 Bolo", "📷 Fotos", "🥂 Festa", "❤️ Casal"],
+        "estetica automotiva": ["✨ Polimento", "🚗 Vitrificacao", "🧹 Higienizacao", "✨ Antes e Depois", "🏆 Resultado", "💎 Premium"],
+        "loja construcao":   ["🧱 Cimento", "🔨 Ferragens", "🎨 Tintas", "🪟 Esquadrias", "🔩 Parafusos", "🏗️ Materiais"],
+        "turismo":           ["✈️ Destino", "🏖️ Praia", "🏔️ Montanha", "🗺️ Roteiro", "🏨 Hotel", "🌟 Experiencia"],
+        "energia solar":     ["☀️ Instalacao", "🔧 Painel Solar", "💡 Ligacao", "📊 Monitoramento", "🏠 Residencial", "🏢 Comercial"],
+    }
+    gallery_items = NICHE_GALLERY.get(niche, [f"✨ Trabalho {i+1}" for i in range(6)])
+    # Cycle if fewer than 6
+    while len(gallery_items) < 6:
+        gallery_items += gallery_items
+    gallery_items = gallery_items[:6]
+
+    NICHE_GALLERY_TITLE = {
+        "odontologia": "Sorrisos Transformados", "harmonizacao facial": "Resultados Reais",
+        "beleza": "Nosso Portfolio", "barbearia": "Nossos Trabalhos",
+        "lash design": "Galeria de Cilios", "fitness": "Transformacoes Reais",
+        "crossfit": "Nossos Atletas", "pilates": "Nosso Studio",
+        "gastronomia": "Nossos Pratos", "hamburgueria": "Nosso Cardapio",
+        "pizzaria": "Nossas Pizzas", "cafeteria": "Nosso Espaco",
+        "confeitaria": "Nossas Criacoes", "imoveis": "Imoveis em Destaque",
+        "construcao": "Nossas Obras", "arquitetura": "Nossos Projetos",
+        "design interiores": "Ambientes Criados", "moveis planejados": "Projetos Realizados",
+        "moda feminina": "Nossa Colecao", "moda masculina": "Nossa Colecao",
+        "moda": "Nossas Pecas", "veterinaria": "Nossos Pacientes",
+        "petshop": "Nossos Clientes", "fotografia": "Nosso Portfolio",
+        "casamentos": "Casamentos Realizados", "estetica automotiva": "Resultados Reais",
+        "turismo": "Destinos e Experiencias", "energia solar": "Instalacoes Realizadas",
+    }
+    title = NICHE_GALLERY_TITLE.get(niche, "Nosso Portfolio")
+    subtitle = f"Veja alguns dos nossos trabalhos em {niche}" if niche else "Conheca nossa galeria de trabalhos"
+
+    bg2 = p.get("bg2", "#EDF2F7")
+    items_html = "".join(
+        f'<div class="gallery-item" style="font-size:1rem;font-weight:600;color:#4a5568;gap:8px;flex-direction:column">'
+        f'<span style="font-size:2.5rem">{item.split()[0]}</span>'
+        f'<span style="font-size:.8rem">{" ".join(item.split()[1:])}</span>'
+        f'</div>'
+        for item in gallery_items
+    )
     return f"""
 <section class="section section-alt" id="galeria">
-  <h2>Nosso Portfolio</h2>
-  <p class="subtitle">Conheca alguns dos nossos trabalhos em {niche}</p>
-  <div class="gallery-grid">{items}</div>
+  <h2>{title}</h2>
+  <p class="subtitle">{subtitle}</p>
+  <div class="gallery-grid">{items_html}</div>
 </section>"""
 
 
@@ -1961,15 +3102,43 @@ def _sec_pricing(plans, p, hf, bf, cta1):
 </section>"""
 
 
-def _sec_testimonials(testimonials, p, hf, bf):
-    cards = "".join(f'<div class="testimonial-card"><p class="testimonial-text">"{t["text"]}"</p><p class="testimonial-author">- {t["author"]}</p></div>' for t in testimonials)
+def _sec_testimonials(testimonials, p, hf, bf, niche=""):
+    cards = "".join(f'<div class="testimonial-card"><p class="testimonial-text">"{t["text"]}"</p><p class="testimonial-author">— {t["author"]}</p></div>' for t in testimonials)
     acc = p["accent"]
     top = p.get("text_on_primary", "#FFFFFF")
-    stats = f'<div class="stats"><div class="stat"><div class="stat-number">500+</div><div class="stat-label">Clientes atendidos</div></div><div class="stat"><div class="stat-number">98%</div><div class="stat-label">Satisfacao</div></div><div class="stat"><div class="stat-number">5 estrelas</div><div class="stat-label">Avaliacao</div></div></div>'
+
+    # Niche-specific stats
+    NICHE_STATS = {
+        "odontologia": [("2.000+", "Sorrises transformados"), ("98%", "Satisfacao"), ("15 anos", "De experiencia")],
+        "fitness": [("5.000+", "Alunos ativos"), ("30kg", "Media de resultado"), ("10 anos", "De metodologia")],
+        "crossfit": [("800+", "Atletas treinados"), ("95%", "Renovacao mensal"), ("Coaches", "Certificados")],
+        "imoveis": [("500+", "Imoveis vendidos"), ("R$200M+", "Em negocios"), ("98%", "Satisfacao")],
+        "contabilidade": [("1.000+", "Empresas atendidas"), ("40%", "Reducao media de impostos"), ("15 anos", "De experiencia")],
+        "marketing": [("200+", "Empresas atendidas"), ("3x", "Aumento medio de vendas"), ("500%", "ROI medio")],
+        "tecnologia": [("150+", "Projetos entregues"), ("98%", "No prazo"), ("5 estrelas", "Avaliacao media")],
+        "energia solar": [("2.000+", "Instalacoes"), ("95%", "Economia media"), ("25 anos", "Garantia dos paineis")],
+        "juridico": [("3.000+", "Casos resolvidos"), ("95%", "Taxa de exito"), ("20 anos", "De atuacao")],
+        "educacao": [("10.000+", "Alunos formados"), ("90%", "Empregabilidade"), ("4.9/5", "Avaliacao media")],
+        "turismo": [("5.000+", "Viagens realizadas"), ("4.9/5", "Satisfacao"), ("20 anos", "No mercado")],
+        "gastronomia": [("50.000+", "Pratos servidos"), ("4.9/5", "Avaliacao"), ("10 anos", "De gastronomia")],
+        "saude": [("10.000+", "Pacientes atendidos"), ("98%", "Satisfacao"), ("15 anos", "De experiencia")],
+        "infoprodutos": [("15.000+", "Alunos"), ("4.9/5", "Avaliacao media"), ("95%", "Concluem o curso")],
+        "farmacia": [("10 anos", "Servindo a comunidade"), ("24h", "Atendimento todos os dias"), ("98%", "Clientes satisfeitos")],
+        "loja construcao": [("5.000+", "Obras atendidas"), ("10.000+", "Itens em estoque"), ("10 anos", "No mercado")],
+        "autopecas": [("50.000+", "Pecas em estoque"), ("98%", "Satisfacao"), ("10 anos", "De experiencia")],
+        "optica": [("5.000+", "Clientes atendidos"), ("1h", "Oculos simples prontos"), ("98%", "Satisfacao")],
+        "veterinaria": [("5.000+", "Pets atendidos"), ("24h", "Emergencia"), ("98%", "Satisfacao")],
+        "petshop": [("3.000+", "Pets atendidos", ), ("98%", "Clientes voltam"), ("5 estrelas", "Avaliacao")],
+    }
+    stats_data = NICHE_STATS.get(niche, [("500+", "Clientes atendidos"), ("98%", "Satisfacao"), ("5 estrelas", "Avaliacao")])
+    stats = "".join(
+        f'<div class="stat"><div class="stat-number">{s[0]}</div><div class="stat-label">{s[1]}</div></div>'
+        for s in stats_data
+    )
     return f"""
 <section class="section section-dark" id="depoimentos">
   <h2>O que nossos clientes dizem</h2>
-  {stats}
+  <div class="stats">{stats}</div>
   <div class="testimonials-grid">{cards}</div>
 </section>"""
 
@@ -2074,10 +3243,39 @@ def _sec_map(name, location, p, hf, bf, phone, email, address="", schedule=None)
 
 
 def _sec_cta(name, niche, cta2, p, hf, bf):
+    # Niche-specific CTA section copy
+    NICHE_CTA_COPY: dict[str, tuple[str, str]] = {
+        "farmacia":        ("Precisa de medicamentos ou produtos de saude?",
+                            f"O {name} esta aberto para voce 24 horas por dia, 7 dias por semana. Venha nos visitar ou entre em contato agora."),
+        "loja construcao": ("Sua obra precisa dos melhores materiais?",
+                            f"O {name} tem tudo para sua construcao ou reforma. Entrega rapida e os melhores precos da regiao."),
+        "autopecas":       ("Precisa de pecas para seu veiculo?",
+                            f"O {name} tem o maior estoque de pecas da regiao. Fale com nossa equipe e resolva agora."),
+        "optica":          ("Cuide da sua visao com quem entende do assunto.",
+                            f"Agende seu exame de vista gratuito no {name} e encontre os oculos perfeitos para voce."),
+        "gastronomia":     ("Pronto para uma experiencia gastronomica inesquecivel?",
+                            f"Reserve sua mesa no {name} e vivencie sabores que ficam na memoria."),
+        "hamburgueria":    ("Com fome? O melhor hamburguer esta esperando por voce.",
+                            f"Faca seu pedido agora no {name} e receba em casa ou venha pessoalmente."),
+        "petshop":         ("Seu pet merece o melhor cuidado.",
+                            f"Agende o banho e tosa do seu pet no {name} e garanta o horario hoje mesmo."),
+        "veterinaria":     ("A saude do seu pet nao pode esperar.",
+                            f"O {name} esta pronto para atender seu animal de estimacao. Agende ou venha agora."),
+        "moda feminina":   ("Sua nova peca favorita esta aqui.",
+                            f"Confira a colecao completa do {name} e encontre o look perfeito para voce."),
+        "moda masculina":  ("Vista-se com estilo e qualidade.",
+                            f"Confira os lancamentos do {name} e monte o look ideal para qualquer ocasiao."),
+        "moda":            ("Sua nova peca favorita esta esperando por voce.",
+                            f"Confira a colecao do {name} e encontre pecas que combinam com o seu estilo."),
+    }
+    title, desc = NICHE_CTA_COPY.get(niche, (
+        "Pronto para comecar?",
+        f"Entre em contato agora e descubra como o {name} pode transformar seus resultados em {niche}.",
+    ))
     return f"""
 <section class="cta-section">
-  <h2>Pronto para comecar?</h2>
-  <p>Entre em contato agora e descubra como o {name} pode transformar seus resultados em {niche}.</p>
+  <h2>{title}</h2>
+  <p>{desc}</p>
   <a href="#contato" class="btn-cta">{cta2}</a>
 </section>"""
 

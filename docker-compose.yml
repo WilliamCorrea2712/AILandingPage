@@ -202,6 +202,27 @@ services:
       - ai-lp-network
     command: npm run dev
 
+  # ── Nginx (Reverse Proxy / API Gateway) ────────────────────────────────────
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: ai-lp-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+      - frontend
+    networks:
+      - ai-lp-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
 volumes:
   postgres_data:
   redis_data:

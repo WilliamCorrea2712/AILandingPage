@@ -30,33 +30,59 @@ OLLAMA_TIMEOUT = 90
 OLLAMA_KEEP_ALIVE = "10m"
 
 # ── Base system prompt ────────────────────────────────────────────────────────
-BASE_SYSTEM_PROMPT = """Você extrai informações de prompts para landing pages em português. Retorne APENAS JSON válido, sem texto extra.
+BASE_SYSTEM_PROMPT = """Você extrai informações de prompts para criação de landing pages em português brasileiro. Retorne APENAS JSON válido, sem texto extra, sem markdown.
 
-Campos obrigatórios:
-- business_name: nome do negócio (string ou null)
-- niche: nicho em português minúsculas (ex: "odontologia", "fitness", "igreja", "loja construcao") (string)
-- business_type: tipo de negócio (string)
-- services: serviços mencionados (array de strings, max 5)
-- address: endereço completo (string ou null)
-- schedule: horários com {day, time, event} (array ou [])
-- phone: telefone (string ou null)
-- email: email (string ou null)
-- whatsapp: número whatsapp (string ou null)
-- instagram: @ instagram (string ou null)
-- location: cidade/bairro (string ou null)
-- visual_style: "moderno", "corporativo", "minimalista" ou "agressivo"
-- tone: "formal" ou "informal"
-- target_audience: público-alvo (string)
-- differentials: diferenciais mencionados (array, max 4)
-- wants_map: true se endereço mencionado (boolean)
-- wants_form: true se formulário/contato/agendamento mencionado (boolean)
-- wants_faq: true se FAQ mencionado (boolean)
-- wants_pricing: true se preços/planos mencionados (boolean)
-- intention: "captar leads", "vender produto", "divulgar evento" ou "vender curso"
-- testimonial_count: número de depoimentos pedidos (integer, padrão 3)
-- extra_info: outras informações relevantes (string ou null)
+CAMPOS OBRIGATÓRIOS (extraia com atenção a cada detalhe do prompt):
 
-Retorne APENAS o JSON."""
+Negócio:
+- business_name: nome exato do negócio entre aspas ou mencionado explicitamente (string ou null)
+- niche: nicho em português minúsculas. Ex: "odontologia", "fitness", "farmacia", "loja construcao", "barbearia", "crossfit", "advocacia" (string)
+- business_type: descrição do tipo de negócio. Ex: "Farmácia", "Clínica Odontológica", "Academia de CrossFit" (string)
+- services: produtos ou serviços mencionados explicitamente (array de strings, max 6)
+- differentials: diferenciais competitivos mencionados. Ex: "10 anos de experiência", "atendimento 24h", "garantia de satisfação" (array, max 5)
+- target_audience: público-alvo descrito. Se disser "todos" retorne "público geral" (string)
+
+Contato e localização:
+- address: endereço completo se mencionado (string ou null)
+- location: cidade ou bairro (string ou null)
+- phone: número de telefone (string ou null)
+- email: endereço de email (string ou null)
+- whatsapp: número WhatsApp (string ou null)
+- instagram: @ do instagram SEM o @ (string ou null)
+- schedule: horários de funcionamento como array de {day, time, event}. Ex: [{day:"Segunda a Sexta", time:"08:00 às 18:00", event:""}] (array ou [])
+
+Estilo visual:
+- visual_style: "moderno", "corporativo", "minimalista" ou "agressivo". Escolha baseado no tipo de negócio e palavras-chave do prompt (string)
+- tone: "formal" se o negócio for profissional/saúde/jurídico, "informal" se for jovem/esporte/entretenimento (string)
+- primary_color: cor principal mencionada em português. Ex: "azul", "verde", "vermelho" (string ou null)
+- accent_color: cor secundária mencionada (string ou null)
+
+Intenção e seções:
+- intention: "captar leads", "vender produto", "divulgar evento" ou "vender curso" (string)
+- wants_form: true se formulário, contato, cadastro, agendamento ou WhatsApp mencionado (boolean)
+- wants_faq: true se FAQ, perguntas frequentes, dúvidas mencionado (boolean)
+- wants_pricing: true se preços, planos, tabela, valores mencionado (boolean)
+- wants_gallery: true se galeria, fotos, portfólio, antes e depois mencionado (boolean)
+- wants_map: true se endereço, mapa, localização, "como chegar" mencionado (boolean)
+- wants_video: true se vídeo, youtube, apresentação em vídeo mencionado (boolean)
+- wants_countdown: true se contador, urgência, oferta limitada, vagas limitadas mencionado (boolean)
+- wants_about: true se "sobre nós", "sobre a empresa", "quem somos", "história" mencionado (boolean)
+- wants_partners: true se parceiros, clientes, certificações, selos mencionado (boolean)
+- testimonial_count: quantos depoimentos pediu (integer, padrão 3, máximo 6)
+- banner_count: quantos banners/heroes pediu (integer, padrão 1, máximo 4)
+- sections_requested: lista de seções explicitamente pedidas. Ex: ["formulario", "faq", "galeria", "mapa", "sobre"] (array)
+
+Extra:
+- extra_info: qualquer informação relevante não capturada acima. Ex: promoções, história, diferenciais únicos (string ou null)
+
+REGRAS IMPORTANTES:
+- Se o prompt mencionar "remédio", "medicamento" → services inclua "Medicamentos"
+- Se mencionar "perfumaria", "higiene" → services inclua "Perfumaria e Higiene"
+- Se mencionar "todos" como público → target_audience = "público geral"
+- Extraia TUDO que está no prompt, não invente nada que não foi dito
+- Horários como "Segunda a Sexta: 08h às 18h" → schedule: [{day:"Segunda a Sexta", time:"08:00 às 18:00", event:""}]
+
+Retorne APENAS o JSON, sem explicações."""
 
 COLOR_NAMES = {
     "azul": "#1A56DB", "vermelho": "#C53030", "verde": "#276749",
@@ -74,9 +100,8 @@ COLOR_NAMES = {
 def _load_few_shot_examples(niche: str, limit: int = 2) -> list[dict]:
     """
     Load top approved training examples for the given niche from the DB.
-    Returns list of {prompt, completion} dicts.
-    Uses the pattern_cache and training_data tables.
-    Falls back to empty list if DB unavailable.
+    Threshold lowered to 0.65 to include default-score (0.7) entries
+    until human feedback pushes scores higher.
     """
     if not niche or niche == "negocios":
         return []
@@ -86,12 +111,11 @@ def _load_few_shot_examples(niche: str, limit: int = 2) -> list[dict]:
         from app.models.training_data import TrainingData
 
         with get_db_session() as db:
-            # Get high-quality validated examples for this niche
             rows = (
                 db.query(TrainingData)
                 .filter(
                     TrainingData.is_validated == True,
-                    TrainingData.quality_score >= 0.8,
+                    TrainingData.quality_score >= 0.65,  # was 0.8 — too restrictive
                     TrainingData.prompt.ilike(f"%{niche}%"),
                 )
                 .order_by(TrainingData.quality_score.desc(), TrainingData.created_at.desc())
@@ -102,14 +126,13 @@ def _load_few_shot_examples(niche: str, limit: int = 2) -> list[dict]:
             examples = []
             for row in rows:
                 try:
-                    # completion is JSON with niche, headline, sections, style
                     comp = json.loads(row.completion)
                     examples.append({
-                        "prompt": row.prompt[:300],  # truncate for token budget
-                        "niche": comp.get("niche", niche),
+                        "prompt":   row.prompt[:300],
+                        "niche":    comp.get("niche", niche),
                         "headline": comp.get("headline", ""),
                         "sections": comp.get("sections", []),
-                        "style": comp.get("style", ""),
+                        "style":    comp.get("style", ""),
                     })
                 except (json.JSONDecodeError, Exception):
                     pass
@@ -123,13 +146,14 @@ def _load_few_shot_examples(niche: str, limit: int = 2) -> list[dict]:
 
 def _load_pattern_examples(niche: str) -> dict[str, list[str]]:
     """
-    Load top patterns from pattern_cache for a given niche.
-    These are extracted from real approved user generations.
+    Load top patterns from pattern_cache for a given niche using
+    the same diversity score as get_learned_patterns().
     """
     if not niche or niche == "negocios":
         return {}
 
     try:
+        import math
         from app.database import get_db_session
         from app.models.pattern_cache import PatternCache
 
@@ -137,19 +161,25 @@ def _load_pattern_examples(niche: str) -> dict[str, list[str]]:
             rows = (
                 db.query(PatternCache)
                 .filter(PatternCache.niche == niche)
-                .order_by(
-                    PatternCache.avg_rating.desc().nullslast(),
-                    PatternCache.frequency.desc(),
-                )
-                .limit(20)
+                .order_by(PatternCache.avg_rating.desc().nullslast())
+                .limit(40)
                 .all()
             )
 
+            # Re-rank by diversity score
+            def diversity_score(row) -> float:
+                rating = row.avg_rating if row.avg_rating is not None else 1.0
+                freq = max(row.frequency, 1)
+                return rating * (1.0 / math.log2(freq + 2))
+
+            ranked = sorted(rows, key=diversity_score, reverse=True)
+
             patterns: dict[str, list[str]] = {}
-            for row in rows:
+            for row in ranked:
                 if row.pattern_type not in patterns:
                     patterns[row.pattern_type] = []
-                patterns[row.pattern_type].append(row.value)
+                if len(patterns[row.pattern_type]) < 5:
+                    patterns[row.pattern_type].append(row.value)
 
             return patterns
 
@@ -287,7 +317,11 @@ def is_ollama_available() -> bool:
 
 
 def normalize_llm_context(llm_ctx: dict, original_prompt: str) -> dict[str, Any]:
-    """Normalize LLM output to match generation pipeline format."""
+    """Normalize LLM output to match generation pipeline format.
+    Handles all fields from the improved BASE_SYSTEM_PROMPT including
+    wants_gallery, wants_video, wants_countdown, wants_about, sections_requested,
+    banner_count, and color names.
+    """
 
     def safe_str(val, default="") -> str:
         return str(val).strip() if val and str(val).strip() not in ("null", "None", "") else default
@@ -305,6 +339,84 @@ def normalize_llm_context(llm_ctx: dict, original_prompt: str) -> dict[str, Any]
     def safe_int(val, default=3) -> int:
         try: return int(val)
         except (TypeError, ValueError): return default
+
+    # ── Schedule ──────────────────────────────────────────────────────────
+    schedule = []
+    for item in safe_list(llm_ctx.get("schedule")):
+        if isinstance(item, dict):
+            schedule.append({
+                "day":   safe_str(item.get("day"), ""),
+                "time":  safe_str(item.get("time"), ""),
+                "event": safe_str(item.get("event"), ""),
+            })
+
+    # ── Colors — accept hex or portuguese name ─────────────────────────────
+    primary_color = safe_str(llm_ctx.get("primary_color"))
+    accent_color  = safe_str(llm_ctx.get("accent_color"))
+    if primary_color and not primary_color.startswith("#"):
+        primary_color = COLOR_NAMES.get(primary_color.lower(), "")
+    if accent_color and not accent_color.startswith("#"):
+        accent_color = COLOR_NAMES.get(accent_color.lower(), "")
+
+    # ── Form fields — infer from prompt ───────────────────────────────────
+    form_fields = ["Nome", "E-mail"]
+    pl = original_prompt.lower()
+    if any(w in pl for w in ["telefone", "celular", "whatsapp", "fone", "zap"]):
+        form_fields.append("Telefone/WhatsApp")
+    if any(w in pl for w in ["empresa", "cnpj"]):
+        form_fields.append("Empresa")
+    if any(w in pl for w in ["mensagem", "assunto", "duvida", "comentario"]):
+        form_fields.append("Mensagem")
+    if any(w in pl for w in ["data", "horario", "agendamento", "consulta"]):
+        form_fields.append("Data preferida")
+    if any(w in pl for w in ["cidade", "estado", "regiao"]):
+        form_fields.append("Cidade")
+
+    # ── sections_requested — from LLM + prompt keywords ───────────────────
+    sections_requested = safe_list(llm_ctx.get("sections_requested"))
+    # Also detect from flags the LLM set
+    if safe_bool(llm_ctx.get("wants_about")) and "about" not in sections_requested:
+        sections_requested.append("about")
+    if safe_bool(llm_ctx.get("wants_partners")) and "partners" not in sections_requested:
+        sections_requested.append("partners")
+    if safe_bool(llm_ctx.get("wants_countdown")) and "countdown" not in sections_requested:
+        sections_requested.append("countdown")
+    if safe_bool(llm_ctx.get("wants_video")) and "video" not in sections_requested:
+        sections_requested.append("video")
+
+    return {
+        "business_name":      safe_str(llm_ctx.get("business_name")),
+        "niche":              safe_str(llm_ctx.get("niche"), "negocios"),
+        "business_type":      safe_str(llm_ctx.get("business_type"), "Empresa"),
+        "services":           safe_list(llm_ctx.get("services"))[:6],
+        "address":            safe_str(llm_ctx.get("address")),
+        "schedule":           schedule,
+        "phone":              safe_str(llm_ctx.get("phone")),
+        "email":              safe_str(llm_ctx.get("email")),
+        "wa":                 re.sub(r'\D', '', safe_str(llm_ctx.get("whatsapp", ""))) or "",
+        "ig":                 safe_str(llm_ctx.get("instagram", "")).lstrip("@"),
+        "location":           safe_str(llm_ctx.get("location")),
+        "visual_style":       safe_str(llm_ctx.get("visual_style"), "moderno"),
+        "communication_tone": safe_str(llm_ctx.get("tone"), "formal"),
+        "colors":             [c for c in [primary_color, accent_color] if c],
+        "audience":           safe_str(llm_ctx.get("target_audience"), "pessoas que buscam qualidade"),
+        "differentials":      safe_list(llm_ctx.get("differentials"))[:5],
+        "wants_map":          safe_bool(llm_ctx.get("wants_map")) or bool(safe_str(llm_ctx.get("address"))),
+        "wants_form":         safe_bool(llm_ctx.get("wants_form"), True),
+        "wants_faq":          safe_bool(llm_ctx.get("wants_faq")),
+        "wants_gallery":      safe_bool(llm_ctx.get("wants_gallery")),
+        "wants_pricing":      safe_bool(llm_ctx.get("wants_pricing")),
+        "wants_video":        safe_bool(llm_ctx.get("wants_video")),
+        "wants_countdown":    safe_bool(llm_ctx.get("wants_countdown")),
+        "intention":          safe_str(llm_ctx.get("intention"), "captar leads"),
+        "testimonial_count":  safe_int(llm_ctx.get("testimonial_count"), 3),
+        "banner_count":       min(safe_int(llm_ctx.get("banner_count"), 1), 4),
+        "form_fields":        form_fields,
+        "sections_requested": sections_requested,
+        "extra_info":         safe_str(llm_ctx.get("extra_info")),
+        "past_patterns":      [],
+        "original_prompt":    original_prompt,
+    }
 
     schedule = []
     for item in safe_list(llm_ctx.get("schedule")):
